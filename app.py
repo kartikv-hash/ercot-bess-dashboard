@@ -1,80 +1,77 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 
-st.title("ERCOT Battery Arbitrage Dashboard")
+st.title("ERCOT Battery Storage Analysis Platform")
 
 uploaded_file = st.file_uploader("Upload ERCOT LMP CSV", type=["csv"])
 
 if uploaded_file:
 
-    # ---------- READ DATA ----------
     df = pd.read_csv(uploaded_file)
     df.columns = ["Date","Hour","Node","LMP","DST"]
 
-    # ---------- SELECT NODE ----------
     node = st.selectbox("Select Node", df["Node"].unique())
     node_df = df[df["Node"]==node].sort_values("Hour").reset_index(drop=True)
 
-    # ---------- FIND LOW & HIGH LMP ----------
-    low = node_df["LMP"].idxmin()
-    high = node_df["LMP"].idxmax()
+    # ---------- FIND LOW & HIGH ----------
+    low_i = node_df["LMP"].idxmin()
+    high_i = node_df["LMP"].idxmax()
 
-    low_i = low
-    high_i = high
+    low_hr = node_df.loc[low_i,"Hour"]
+    high_hr = node_df.loc[high_i,"Hour"]
 
-    node_df["2hr"] = "Idle"
-    node_df["4hr"] = "Idle"
+    # ---------- CREATE DISPATCH ----------
+    node_df["2hr_dispatch"] = 0
+    node_df["4hr_dispatch"] = 0
 
-    def apply_window(col, center, hrs, label):
-        for i in range(max(0, center-hrs), min(len(node_df), center+hrs+1)):
-            node_df.loc[i, col] = label
+    def apply(center,hrs,col,charge=-1,discharge=1):
+        for i in range(max(0,center-hrs),min(len(node_df),center+hrs+1)):
+            node_df.loc[i,col]=charge
+        for i in range(max(0,high_i-hrs),min(len(node_df),high_i+hrs+1)):
+            node_df.loc[i,col]=discharge
 
-    # ---------- 2 HR STORAGE ----------
-    apply_window("2hr", low_i, 1, "Charge")
-    apply_window("2hr", high_i, 1, "Discharge")
+    apply(low_i,1,"2hr_dispatch")
+    apply(low_i,2,"4hr_dispatch")
 
-    # ---------- 4 HR STORAGE ----------
-    apply_window("4hr", low_i, 2, "Charge")
-    apply_window("4hr", high_i, 2, "Discharge")
+    # ---------- REVENUE ----------
+    node_df["2hr_revenue"]=node_df["2hr_dispatch"]*node_df["LMP"]
+    node_df["4hr_revenue"]=node_df["4hr_dispatch"]*node_df["LMP"]
+
+    rev2=round(node_df["2hr_revenue"].sum(),2)
+    rev4=round(node_df["4hr_revenue"].sum(),2)
+
+    # ---------- STRATEGY LOGIC ----------
+    spread = node_df["LMP"].max()-node_df["LMP"].min()
+
+    if spread > 80:
+        strategy="Pure Arbitrage Opportunity"
+    elif spread > 40:
+        strategy="Arbitrage + Solar Overbuild Synergy"
+    else:
+        strategy="Limited Arbitrage — Capacity / Ancillary Market Preferred"
 
     # ---------- PLOT ----------
-    fig = px.line(node_df, x="Hour", y="LMP", title=f"LMP Price - {node}")
+    fig = go.Figure()
 
-    # 2hr charge
-    fig.add_scatter(
-        x=node_df[node_df["2hr"]=="Charge"]["Hour"],
-        y=node_df[node_df["2hr"]=="Charge"]["LMP"],
-        mode="markers",
-        marker=dict(color="green", size=9),
-        name="2hr Charge"
-    )
+    fig.add_trace(go.Scatter(x=node_df["Hour"],y=node_df["LMP"],name="LMP"))
 
-    # 2hr discharge
-    fig.add_scatter(
-        x=node_df[node_df["2hr"]=="Discharge"]["Hour"],
-        y=node_df[node_df["2hr"]=="Discharge"]["LMP"],
-        mode="markers",
-        marker=dict(color="red", size=9),
-        name="2hr Discharge"
-    )
+    fig.add_trace(go.Scatter(x=node_df["Hour"],y=node_df["2hr_dispatch"]*node_df["LMP"],
+                             name="2hr Storage Operation"))
 
-    # 4hr charge
-    fig.add_scatter(
-        x=node_df[node_df["4hr"]=="Charge"]["Hour"],
-        y=node_df[node_df["4hr"]=="Charge"]["LMP"],
-        mode="markers",
-        marker=dict(color="blue", size=11, symbol="diamond"),
-        name="4hr Charge"
-    )
+    fig.add_trace(go.Scatter(x=node_df["Hour"],y=node_df["4hr_dispatch"]*node_df["LMP"],
+                             name="4hr Storage Operation"))
 
-    # 4hr discharge
-    fig.add_scatter(
-        x=node_df[node_df["4hr"]=="Discharge"]["Hour"],
-        y=node_df[node_df["4hr"]=="Discharge"]["LMP"],
-        mode="markers",
-        marker=dict(color="orange", size=11, symbol="diamond"),
-        name="4hr Discharge"
-    )
+    st.plotly_chart(fig,use_container_width=True)
 
-    st.plotly_chart(fig, use_container_width=True)
+    # ---------- OUTPUT ----------
+    st.subheader("Market Signals")
+    st.write(f"Lowest Price Hour: {low_hr}")
+    st.write(f"Highest Price Hour: {high_hr}")
+
+    st.subheader("Daily Arbitrage Revenue ($/MW)")
+    st.write(f"2hr Storage: ${rev2}")
+    st.write(f"4hr Storage: ${rev4}")
+
+    st.subheader("Recommended Strategy")
+    st.success(strategy)
