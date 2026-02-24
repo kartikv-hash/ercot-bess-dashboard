@@ -1,25 +1,52 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
+# find min & max
+low=node_df["LMP"].idxmin()
+high=node_df["LMP"].idxmax()
 
-st.title("ERCOT Battery Arbitrage Dashboard")
+low_i=node_df.index.get_loc(low)
+high_i=node_df.index.get_loc(high)
 
-uploaded_file = st.file_uploader("Upload ERCOT LMP CSV", type=["csv"])
+node_df["2hr"]="Idle"
+node_df["4hr"]="Idle"
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
+def apply_window(col,center,hrs,label):
+    for i in range(max(0,center-hrs),min(len(node_df),center+hrs+1)):
+        node_df.loc[node_df.index[i],col]=label
 
-    df.columns=["Date","Hour","Node","LMP","DST"]
+# -------- 2 HR STORAGE --------
+apply_window("2hr",low_i,1,"Charge")
+apply_window("2hr",high_i,1,"Discharge")
 
-    node = st.selectbox("Select Node", df["Node"].unique())
+# -------- 4 HR STORAGE --------
+apply_window("4hr",low_i,2,"Charge")
+apply_window("4hr",high_i,2,"Discharge")
 
-    node_df = df[df["Node"]==node].sort_values("Hour")
+# -------- PLOT --------
+fig = px.line(node_df, x="Hour", y="LMP", title=f"LMP Price - {node}")
 
-    fig = px.line(node_df, x="Hour", y="LMP", title=f"LMP Price - {node}")
-    st.plotly_chart(fig,use_container_width=True)
+# 2hr markers
+fig.add_scatter(x=node_df[node_df["2hr"]=="Charge"]["Hour"],
+                y=node_df[node_df["2hr"]=="Charge"]["LMP"],
+                mode="markers",
+                marker=dict(color="green",size=9),
+                name="2hr Charge")
 
-    low=node_df["LMP"].idxmin()
-    high=node_df["LMP"].idxmax()
+fig.add_scatter(x=node_df[node_df["2hr"]=="Discharge"]["Hour"],
+                y=node_df[node_df["2hr"]=="Discharge"]["LMP"],
+                mode="markers",
+                marker=dict(color="red",size=9),
+                name="2hr Discharge")
 
-    st.write("Lowest price hour:", node_df.loc[low,"Hour"])
-    st.write("Highest price hour:", node_df.loc[high,"Hour"])
+# 4hr markers
+fig.add_scatter(x=node_df[node_df["4hr"]=="Charge"]["Hour"],
+                y=node_df[node_df["4hr"]=="Charge"]["LMP"],
+                mode="markers",
+                marker=dict(color="blue",size=11,symbol="diamond"),
+                name="4hr Charge")
+
+fig.add_scatter(x=node_df[node_df["4hr"]=="Discharge"]["Hour"],
+                y=node_df[node_df["4hr"]=="Discharge"]["LMP"],
+                mode="markers",
+                marker=dict(color="orange",size=11,symbol="diamond"),
+                name="4hr Discharge")
+
+st.plotly_chart(fig,use_container_width=True)
