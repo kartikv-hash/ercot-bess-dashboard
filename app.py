@@ -382,38 +382,40 @@ elif page == "📈  LMP Price Analysis":
 
     @st.cache_data
     def load_lmp(f):
-        raw = pd.read_csv(f)
-        # Strip whitespace from column names
+        raw = pd.read_csv(f, sep=None, engine="python")  # auto-detect delimiter
         raw.columns = [c.strip() for c in raw.columns]
 
-        # Try to auto-detect columns by name first
-        col_map = {}
-        for c in raw.columns:
-            cl = c.lower().strip()
-            if "date" in cl and "Date" not in col_map:
-                col_map["Date"] = c
-            elif any(x in cl for x in ["hour", "he", "hour_ending"]) and "Hour" not in col_map:
-                col_map["Hour"] = c
-            elif any(x in cl for x in ["bus", "node", "settlement", "name"]) and "Bus" not in col_map:
-                col_map["Bus"] = c
-            elif any(x in cl for x in ["lmp", "price", "$/mwh"]) and "LMP" not in col_map:
-                col_map["LMP"] = c
-
-        # Fall back to positional mapping if detection incomplete
-        pos_names = ["Date", "Hour", "Bus", "LMP", "DST"]
-        for i, name in enumerate(pos_names):
-            if name not in col_map and i < len(raw.columns):
-                col_map[name] = raw.columns[i]
-
-        rename = {v: k for k, v in col_map.items()}
-        raw = raw.rename(columns=rename)
+        # Explicit rename map — covers ERCOT's exact column names + common variants
+        rename_rules = {
+            # Date
+            "DeliveryDate": "Date", "DELIVERYDATE": "Date", "Oper Day": "Date",
+            "OperDay": "Date", "OPERDAY": "Date", "SETTLEMENT_DATE": "Date",
+            # Hour
+            "HourEnding": "Hour", "HOURENDING": "Hour", "Hour Ending": "Hour",
+            "HOUR_ENDING": "Hour", "HE": "Hour",
+            # Bus
+            "BusName": "Bus", "BUSNAME": "Bus", "Bus Name": "Bus",
+            "SETTLEMENT_POINT": "Bus", "Settlement Point": "Bus", "Node": "Bus",
+            # LMP
+            "LMP": "LMP", "SETTLEMENT_POINT_PRICE": "LMP", "Price": "LMP",
+            # DST
+            "DSTFlag": "DST", "DSTFLAG": "DST", "DST Flag": "DST", "DST_FLAG": "DST",
+        }
+        raw = raw.rename(columns={c: rename_rules[c] for c in raw.columns if c in rename_rules})
 
         # Ensure required columns exist
         for col in ["Date", "Hour", "Bus", "LMP"]:
             if col not in raw.columns:
                 raw[col] = None
 
-        raw["Hour"] = pd.to_numeric(raw["Hour"], errors="coerce")
+        # HourEnding is "01:00" format — extract the hour number
+        if raw["Hour"].dtype == object:
+            raw["Hour"] = (
+                raw["Hour"].astype(str).str.strip()
+                .str.extract(r"(\d+)")[0]
+                .astype(float)
+            )
+
         raw["LMP"]  = pd.to_numeric(raw["LMP"],  errors="coerce")
         raw["Date"] = raw["Date"].astype(str).str.strip()
         raw["Bus"]  = raw["Bus"].astype(str).str.strip()
