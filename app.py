@@ -1,4 +1,4 @@
-import streamlit as st
+mport streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
@@ -383,10 +383,41 @@ elif page == "📈  LMP Price Analysis":
     @st.cache_data
     def load_lmp(f):
         raw = pd.read_csv(f)
-        raw.columns = ["Date", "Hour", "Bus", "LMP", "DST"]
+        # Strip whitespace from column names
+        raw.columns = [c.strip() for c in raw.columns]
+
+        # Try to auto-detect columns by name first
+        col_map = {}
+        for c in raw.columns:
+            cl = c.lower().strip()
+            if "date" in cl and "Date" not in col_map:
+                col_map["Date"] = c
+            elif any(x in cl for x in ["hour", "he", "hour_ending"]) and "Hour" not in col_map:
+                col_map["Hour"] = c
+            elif any(x in cl for x in ["bus", "node", "settlement", "name"]) and "Bus" not in col_map:
+                col_map["Bus"] = c
+            elif any(x in cl for x in ["lmp", "price", "$/mwh"]) and "LMP" not in col_map:
+                col_map["LMP"] = c
+
+        # Fall back to positional mapping if detection incomplete
+        pos_names = ["Date", "Hour", "Bus", "LMP", "DST"]
+        for i, name in enumerate(pos_names):
+            if name not in col_map and i < len(raw.columns):
+                col_map[name] = raw.columns[i]
+
+        rename = {v: k for k, v in col_map.items()}
+        raw = raw.rename(columns=rename)
+
+        # Ensure required columns exist
+        for col in ["Date", "Hour", "Bus", "LMP"]:
+            if col not in raw.columns:
+                raw[col] = None
+
         raw["Hour"] = pd.to_numeric(raw["Hour"], errors="coerce")
         raw["LMP"]  = pd.to_numeric(raw["LMP"],  errors="coerce")
-        raw = raw.dropna(subset=["Hour","LMP"]).reset_index(drop=True)
+        raw["Date"] = raw["Date"].astype(str).str.strip()
+        raw["Bus"]  = raw["Bus"].astype(str).str.strip()
+        raw = raw.dropna(subset=["Hour", "LMP"]).reset_index(drop=True)
         return raw
 
     df = load_lmp(uploaded)
@@ -405,9 +436,12 @@ elif page == "📈  LMP Price Analysis":
     if len(dates) > 1:
         selected_date = st.selectbox("Select Date", dates)
         bdf = df[(df["Bus"] == bus) & (df["Date"] == selected_date)].sort_values("Hour").reset_index(drop=True)
-    else:
+    elif len(dates) == 1:
         selected_date = dates[0]
         bdf = df[df["Bus"] == bus].sort_values("Hour").reset_index(drop=True)
+    else:
+        st.error("Could not read a Date column from your CSV. Check the column names match: Date, Hour, Bus Name, LMP, DST")
+        st.stop()
 
     if bdf.empty:
         st.warning("No data for this Bus / Date combination.")
