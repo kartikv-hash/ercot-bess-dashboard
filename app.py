@@ -19,6 +19,8 @@ if "selected_bus"   not in st.session_state: st.session_state.selected_bus   = N
 if "lmp_df"         not in st.session_state: st.session_state.lmp_df         = None
 if "chat_history"   not in st.session_state: st.session_state.chat_history   = []
 
+SECOND_APP_URL = "https://fatal-flaw-o7aks4agtoffgyydbvrguj.streamlit.app/"
+
 # ─────────────────────────────────────────────
 #  CSS
 # ─────────────────────────────────────────────
@@ -148,6 +150,7 @@ with st.sidebar:
     st.markdown("## ⚡ ERCOT BESS")
     st.markdown("---")
     page = st.radio("Module", [
+        "🏠  Home",
         "🗺️  Node Analyser",
         "📈  LMP Price Analysis",
         "🤖  AI Copilot"
@@ -163,12 +166,110 @@ with st.sidebar:
         df = st.session_state.lmp_df
     else:
         df = None
+    st.markdown("---")
+    st.markdown("### 🔗 Other Tools")
+    st.markdown(f'<a href="{SECOND_APP_URL}" target="_blank"><button style="width:100%;padding:8px;background:#1e2a3a;color:#4fc3f7;border:1px solid #2a3d55;border-radius:8px;cursor:pointer;font-size:13px;">⚡ Open BESS Strategy App</button></a>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════
+#  HOME PAGE
+# ══════════════════════════════════════════════
+if page == "🏠  Home":
+    st.markdown("""
+    <div style="text-align:center;padding:40px 0 20px 0;">
+        <div style="font-size:52px;">⚡</div>
+        <h1 style="font-size:32px;font-weight:800;margin:8px 0 4px 0;">ERCOT BESS Intelligence Platform</h1>
+        <p style="color:#7880a8;font-size:15px;margin:0;">Battery Energy Storage & LMP Analysis Suite</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 🚀 Select a Tool to Get Started")
+    st.markdown("")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#1a1d2e,#1e2540);border:1px solid #2a2d55;
+                    border-radius:16px;padding:28px 24px;height:100%;">
+            <div style="font-size:36px;margin-bottom:12px;">⚡</div>
+            <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:8px;">
+                ERCOT BESS Dashboard
+            </div>
+            <div style="color:#7880a8;font-size:13px;line-height:1.7;margin-bottom:20px;">
+                <b style="color:#5de0a5;">Current App</b><br><br>
+                🗺️ &nbsp;Hub & Node Analyser with OSM map<br>
+                📈 &nbsp;LMP Price Analysis & BESS strategy<br>
+                📊 &nbsp;Top N buses, spread ranking, export<br>
+                🤖 &nbsp;AI Copilot powered by Claude
+            </div>
+            <div style="background:#5de0a520;border:1px solid #5de0a540;border-radius:8px;
+                        padding:8px 14px;display:inline-block;color:#5de0a5;font-size:12px;font-weight:600;">
+                ✅ You are here
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c2:
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#1a1d2e,#1e2540);border:1px solid #2a2d55;
+                    border-radius:16px;padding:28px 24px;height:100%;">
+            <div style="font-size:36px;margin-bottom:12px;">🔋</div>
+            <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:8px;">
+                BESS Strategy App
+            </div>
+            <div style="color:#7880a8;font-size:13px;line-height:1.7;margin-bottom:20px;">
+                Comprehensive BESS project strategy and financial modelling tool.<br><br>
+                🔋 &nbsp;Overbuild vs Augmentation analysis<br>
+                💰 &nbsp;Project NPV & revenue projections<br>
+                📉 &nbsp;Capacity degradation modelling<br>
+                📋 &nbsp;Development strategy recommendations
+            </div>
+            <a href="{SECOND_APP_URL}" target="_blank"
+               style="background:#4f6ef7;color:#fff;padding:9px 20px;border-radius:8px;
+                      font-size:13px;font-weight:600;text-decoration:none;display:inline-block;">
+                🚀 Open App →
+            </a>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("")
+    st.markdown("---")
+
+    # Quick stats if data loaded
+    if df is not None:
+        st.markdown("### 📊 Loaded Dataset Overview")
+        k1,k2,k3,k4 = st.columns(4)
+        with k1: metric_card("Total Records",  f"{len(df):,}")
+        with k2: metric_card("Unique Buses",   f"{df['Bus'].nunique():,}")
+        with k3: metric_card("Avg LMP",        f"${df['LMP'].mean():.2f}", "$/MWh")
+        with k4: metric_card("Max LMP",        f"${df['LMP'].max():.2f}", f"{df.loc[df['LMP'].idxmax(),'Bus']}")
+        st.markdown("")
+        top3 = (df.groupby("Bus")["LMP"]
+                .agg(spread=lambda x: x.max()-x.min())
+                .sort_values("spread", ascending=False)
+                .head(3).reset_index())
+        st.markdown("**🏆 Top 3 Buses by Spread**")
+        t1, t2, t3 = st.columns(3)
+        for col, (_, row) in zip([t1,t2,t3], top3.iterrows()):
+            with col:
+                metric_card(row["Bus"], f"${row['spread']:.2f}", "spread $/MWh")
+    else:
+        st.info("👈  Upload an ERCOT LMP CSV from the sidebar to see your dataset overview here.")
+
+    st.markdown("")
+    st.markdown("""
+    <div style="text-align:center;color:#3a3e55;font-size:12px;padding:20px 0 0 0;">
+        Built for ERCOT BESS Development · Powered by Claude AI · Data from OpenStreetMap & ERCOT
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════
 #  PAGE 1 – NODE ANALYSER
 # ══════════════════════════════════════════════
-if page == "🗺️  Node Analyser":
+elif page == "🗺️  Node Analyser":
     st.title("🗺️  Hub & Node Analyser")
     st.caption("Discovers transmission substations from OpenStreetMap. Hubs = 230 kV+ | Nodes = below 230 kV")
 
