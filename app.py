@@ -168,7 +168,7 @@ with st.sidebar:
         df = None
     st.markdown("---")
     st.markdown("### 🔗 Other Tools")
-    st.markdown(f'<a href="{SECOND_APP_URL}" target="_blank"><button style="width:100%;padding:8px;background:#1e2a3a;color:#4fc3f7;border:1px solid #2a3d55;border-radius:8px;cursor:pointer;font-size:13px;">⚡ Open Fatal Flaw Analyser</button></a>', unsafe_allow_html=True)
+    st.markdown(f'<a href="{SECOND_APP_URL}" target="_blank"><button style="width:100%;padding:8px;background:#1e2a3a;color:#4fc3f7;border:1px solid #2a3d55;border-radius:8px;cursor:pointer;font-size:13px;">📍 Open Fatal Flaw Analyser — SiteIQ</button></a>', unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════
@@ -215,21 +215,22 @@ if page == "🏠  Home":
         st.markdown(f"""
         <div style="background:linear-gradient(135deg,#1a1d2e,#1e2540);border:1px solid #2a2d55;
                     border-radius:16px;padding:28px 24px;height:100%;">
-            <div style="font-size:36px;margin-bottom:12px;">🔋</div>
+            <div style="font-size:36px;margin-bottom:12px;">📍</div>
             <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:8px;">
-                Fatal Flaw Analyser
+                Fatal Flaw Analyser — SiteIQ
             </div>
             <div style="color:#7880a8;font-size:13px;line-height:1.7;margin-bottom:20px;">
-                Comprehensive BESS project strategy and financial modelling tool.<br><br>
-                🔋 &nbsp;Overbuild vs Augmentation analysis<br>
-                💰 &nbsp;Project NPV & revenue projections<br>
-                📉 &nbsp;Capacity degradation modelling<br>
-                📋 &nbsp;Development strategy recommendations
+                Renewable energy site screening & fatal flaw identification tool.<br><br>
+                🗺️ &nbsp;Click-on-map site selection anywhere in the US<br>
+                ⚠️ &nbsp;Fatal flaw screening — wetlands, flood zones, species<br>
+                🌞 &nbsp;Solar & wind resource assessment per parcel<br>
+                🏗️ &nbsp;Soil suitability, topography & grid access analysis<br>
+                📊 &nbsp;Value & risk index scoring with PDF export
             </div>
             <a href="{SECOND_APP_URL}" target="_blank"
                style="background:#4f6ef7;color:#fff;padding:9px 20px;border-radius:8px;
                       font-size:13px;font-weight:600;text-decoration:none;display:inline-block;">
-                🚀 Open App →
+                🚀 Open SiteIQ →
             </a>
         </div>
         """, unsafe_allow_html=True)
