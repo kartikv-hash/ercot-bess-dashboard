@@ -168,7 +168,7 @@ with st.sidebar:
         df = None
     st.markdown("---")
     st.markdown("### 🔗 Other Tools")
-    st.markdown(f'<a href="{SECOND_APP_URL}" target="_blank"><button style="width:100%;padding:8px;background:#1e2a3a;color:#4fc3f7;border:1px solid #2a3d55;border-radius:8px;cursor:pointer;font-size:13px;">⚡ Open BESS Strategy App</button></a>', unsafe_allow_html=True)
+    st.markdown(f'<a href="{SECOND_APP_URL}" target="_blank"><button style="width:100%;padding:8px;background:#1e2a3a;color:#4fc3f7;border:1px solid #2a3d55;border-radius:8px;cursor:pointer;font-size:13px;">⚡ Open Fatal Flaw Analyser</button></a>', unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════
@@ -217,7 +217,7 @@ if page == "🏠  Home":
                     border-radius:16px;padding:28px 24px;height:100%;">
             <div style="font-size:36px;margin-bottom:12px;">🔋</div>
             <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:8px;">
-                BESS Strategy App
+                Fatal Flaw Analyser
             </div>
             <div style="color:#7880a8;font-size:13px;line-height:1.7;margin-bottom:20px;">
                 Comprehensive BESS project strategy and financial modelling tool.<br><br>
