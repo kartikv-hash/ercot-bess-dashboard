@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,12 +13,11 @@ import io
 st.set_page_config(page_title="ERCOT BESS Dashboard", page_icon="⚡", layout="wide")
 
 # ─────────────────────────────────────────────
-#  SESSION STATE INIT
+#  SESSION STATE
 # ─────────────────────────────────────────────
-if "selected_bus" not in st.session_state:
-    st.session_state.selected_bus = None
-if "lmp_df" not in st.session_state:
-    st.session_state.lmp_df = None
+if "selected_bus"   not in st.session_state: st.session_state.selected_bus   = None
+if "lmp_df"         not in st.session_state: st.session_state.lmp_df         = None
+if "chat_history"   not in st.session_state: st.session_state.chat_history   = []
 
 # ─────────────────────────────────────────────
 #  CSS
@@ -37,8 +35,6 @@ st.markdown("""
       font-size:12px; font-weight:600; color:#7880a8;
       text-transform:uppercase; letter-spacing:1px; margin:18px 0 10px 0;
   }
-  .copilot-msg-user { background:#1e2a3a; border-radius:10px; padding:10px 14px; margin:6px 0; }
-  .copilot-msg-ai   { background:#1a2e1e; border-radius:10px; padding:10px 14px; margin:6px 0; border-left:3px solid #5de0a5; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,9 +58,9 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     return round(R * 2 * math.asin(math.sqrt(a)), 2)
 
 KV_MAP = {
-    "34.5 kV": 34500, "69 kV": 69000, "115 kV": 115000,
-    "138 kV": 138000, "230 kV": 230000, "345 kV": 345000,
-    "500 kV": 500000, "765 kV": 765000,
+    "34.5 kV":34500,"69 kV":69000,"115 kV":115000,
+    "138 kV":138000,"230 kV":230000,"345 kV":345000,
+    "500 kV":500000,"765 kV":765000,
 }
 
 def nearest_kv_label(volts):
@@ -75,14 +71,59 @@ def nearest_kv_label(volts):
             best, best_diff = label, diff
     return best if best_diff < 0.20 else f"{volts/1000:.1f} kV"
 
+# ─────────────────────────────────────────────
+#  ROLLING-AVERAGE BESS HELPER
+#
+#  Uses a 3-hr centred rolling average to find
+#  the smoothed low & high price hours, then
+#  sets charge/discharge windows of ±half_w hrs
+#  around those smoothed peaks.
+#  Returns: (net_revenue, roll_series,
+#            low_hr, high_hr,
+#            charge_window, discharge_window)
+# ─────────────────────────────────────────────
+def bess_calc(bdf: pd.DataFrame, half_w: int):
+    """
+    half_w = 1  →  2-hour storage  (±1 hr window)
+    half_w = 2  →  4-hour storage  (±2 hr window)
+    """
+    roll = (bdf["LMP"]
+            .rolling(window=3, center=True, min_periods=1)
+            .mean()
+            .reset_index(drop=True))
+
+    low_idx  = roll.idxmin()
+    high_idx = roll.idxmax()
+    low_hr   = bdf.loc[low_idx,  "Hour"]
+    high_hr  = bdf.loc[high_idx, "Hour"]
+
+    hr_min = bdf["Hour"].min()
+    hr_max = bdf["Hour"].max()
+
+    charge_win    = (max(hr_min, low_hr  - half_w), min(hr_max, low_hr  + half_w))
+    discharge_win = (max(hr_min, high_hr - half_w), min(hr_max, high_hr + half_w))
+
+    ch_mask  = (bdf["Hour"] >= charge_win[0])    & (bdf["Hour"] <= charge_win[1])
+    dis_mask = (bdf["Hour"] >= discharge_win[0]) & (bdf["Hour"] <= discharge_win[1])
+
+    ch_avg  = bdf.loc[ch_mask,  "LMP"].mean() if ch_mask.any()  else 0
+    dis_avg = bdf.loc[dis_mask, "LMP"].mean() if dis_mask.any() else 0
+    revenue = round(dis_avg - ch_avg, 2)
+
+    return revenue, roll, low_hr, high_hr, charge_win, discharge_win
+
+
 @st.cache_data
 def load_lmp(f):
     raw = pd.read_csv(f, sep=None, engine="python")
     raw.columns = [c.strip() for c in raw.columns]
     rename_rules = {
-        "DeliveryDate":"Date","DELIVERYDATE":"Date","Oper Day":"Date","OperDay":"Date","OPERDAY":"Date","SETTLEMENT_DATE":"Date",
-        "HourEnding":"Hour","HOURENDING":"Hour","Hour Ending":"Hour","HOUR_ENDING":"Hour","HE":"Hour",
-        "BusName":"Bus","BUSNAME":"Bus","Bus Name":"Bus","SETTLEMENT_POINT":"Bus","Settlement Point":"Bus","Node":"Bus",
+        "DeliveryDate":"Date","DELIVERYDATE":"Date","Oper Day":"Date","OperDay":"Date",
+        "OPERDAY":"Date","SETTLEMENT_DATE":"Date",
+        "HourEnding":"Hour","HOURENDING":"Hour","Hour Ending":"Hour",
+        "HOUR_ENDING":"Hour","HE":"Hour",
+        "BusName":"Bus","BUSNAME":"Bus","Bus Name":"Bus",
+        "SETTLEMENT_POINT":"Bus","Settlement Point":"Bus","Node":"Bus",
         "LMP":"LMP","SETTLEMENT_POINT_PRICE":"LMP","Price":"LMP",
         "DSTFlag":"DST","DSTFLAG":"DST","DST Flag":"DST","DST_FLAG":"DST",
     }
@@ -91,23 +132,14 @@ def load_lmp(f):
         if col not in raw.columns:
             raw[col] = None
     if raw["Hour"].dtype == object:
-        raw["Hour"] = raw["Hour"].astype(str).str.strip().str.extract(r"(\d+)")[0].astype(float)
+        raw["Hour"] = (raw["Hour"].astype(str).str.strip()
+                       .str.extract(r"(\d+)")[0].astype(float))
     raw["LMP"]  = pd.to_numeric(raw["LMP"],  errors="coerce")
     raw["Date"] = raw["Date"].astype(str).str.strip()
     raw["Bus"]  = raw["Bus"].astype(str).str.strip()
     raw = raw.dropna(subset=["Hour","LMP"]).reset_index(drop=True)
     return raw
 
-def bess_revenue(bdf, half_charge, half_discharge):
-    low_i  = bdf["LMP"].idxmin()
-    high_i = bdf["LMP"].idxmax()
-    low_hr  = bdf.loc[low_i,  "Hour"]
-    high_hr = bdf.loc[high_i, "Hour"]
-    ch_mask  = (bdf["Hour"] >= low_hr  - half_charge)  & (bdf["Hour"] <= low_hr  + half_charge)
-    dis_mask = (bdf["Hour"] >= high_hr - half_discharge) & (bdf["Hour"] <= high_hr + half_discharge)
-    ch_avg  = bdf.loc[ch_mask,  "LMP"].mean() if ch_mask.any()  else 0
-    dis_avg = bdf.loc[dis_mask, "LMP"].mean() if dis_mask.any() else 0
-    return round(dis_avg - ch_avg, 2), low_hr, high_hr
 
 # ─────────────────────────────────────────────
 #  SIDEBAR
@@ -141,22 +173,35 @@ if page == "🗺️  Node Analyser":
     st.caption("Discovers transmission substations from OpenStreetMap. Hubs = 230 kV+ | Nodes = below 230 kV")
 
     st.markdown('<div class="section-header">Search Parameters</div>', unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([2, 2, 3])
+    c1, c2, c3 = st.columns([2,2,3])
     with c1:
-        lat = st.number_input("Latitude",  value=33.7944, format="%.4f")
-        lon = st.number_input("Longitude", value=-98.5706, format="%.4f")
+        lat_str = st.text_input("Latitude",  value="", placeholder="e.g. 33.7944")
+        lon_str = st.text_input("Longitude", value="", placeholder="e.g. -98.5706")
     with c2:
-        radius_miles = st.selectbox("Search Radius (miles)", [5,10,25,50,100,150], index=2)
+        radius_miles     = st.selectbox("Search Radius (miles)", [5,10,25,50,100,150], index=2)
         hub_threshold_kv = st.selectbox("Hub threshold (kV ≥)", [115,138,230,345], index=2)
     with c3:
         selected_kv_labels = st.multiselect("Filter Voltages", list(KV_MAP.keys()), default=list(KV_MAP.keys()))
-        show_unknown_v = st.checkbox("Include unknown voltage substations", value=True)
+        show_unknown_v     = st.checkbox("Include unknown voltage substations", value=True)
 
-    zoom_guess = max(7, min(14, round(14 - math.log2(max(1, radius_miles)))))
-    infra_url = f"https://openinframap.org/#{zoom_guess}/{lat:.4f}/{lon:.4f}"
-    st.markdown(f'🔗 **[Open this area in OpenInfraMap]({infra_url})**', unsafe_allow_html=True)
+    # Parse & validate
+    lat, lon = None, None
+    if lat_str.strip() and lon_str.strip():
+        try:
+            lat = float(lat_str.strip())
+            lon = float(lon_str.strip())
+        except ValueError:
+            st.error("⚠️  Please enter valid numeric values for Latitude and Longitude.")
 
-    run_search = st.button("🔍  Search Substations", type="primary")
+    if lat is not None and lon is not None:
+        zoom_guess = max(7, min(14, round(14 - math.log2(max(1, radius_miles)))))
+        infra_url  = f"https://openinframap.org/#{zoom_guess}/{lat:.4f}/{lon:.4f}"
+        st.markdown(f'🔗 **[Open this area in OpenInfraMap]({infra_url})**', unsafe_allow_html=True)
+    else:
+        st.info("👆  Enter a Latitude and Longitude above to search for substations.")
+
+    run_search = st.button("🔍  Search Substations", type="primary",
+                           disabled=(lat is None or lon is None))
 
     if run_search:
         radius_m = radius_miles * 1609.34
@@ -212,29 +257,29 @@ out center tags;
                 if not show_unknown_v:
                     continue
                 kv_label = "Unknown"
-
-            sub_type = tags.get("substation","")
-            classification = "Hub" if (sub_type == "transmission" or (volts is not None and volts >= hub_threshold_v)) else "Node"
-
+            sub_type       = tags.get("substation","")
+            classification = ("Hub" if (sub_type=="transmission" or
+                               (volts is not None and volts >= hub_threshold_v))
+                              else "Node")
             rows.append({
-                "Name": tags.get("name", f"Substation {el['id']}"),
-                "Type": classification,
-                "Voltage": kv_label,
-                "Operator": tags.get("operator","—"),
-                "Substation Tag": sub_type if sub_type else "—",
-                "Lat": round(slat,5),
-                "Lon": round(slon,5),
+                "Name":          tags.get("name", f"Substation {el['id']}"),
+                "Type":          classification,
+                "Voltage":       kv_label,
+                "Operator":      tags.get("operator","—"),
+                "Substation Tag":sub_type if sub_type else "—",
+                "Lat":           round(slat,5),
+                "Lon":           round(slon,5),
                 "Distance (mi)": haversine_miles(lat, lon, slat, slon),
-                "_id": el["id"],
+                "_id":           el["id"],
             })
 
         if not rows:
-            st.warning("No substations found. Try a larger radius or loosen the voltage filters.")
+            st.warning("No substations found. Try a larger radius or loosen voltage filters.")
             st.stop()
 
-        sdf = pd.DataFrame(rows).sort_values("Distance (mi)").reset_index(drop=True)
-        n_hub  = (sdf["Type"] == "Hub").sum()
-        n_node = (sdf["Type"] == "Node").sum()
+        sdf   = pd.DataFrame(rows).sort_values("Distance (mi)").reset_index(drop=True)
+        n_hub  = (sdf["Type"]=="Hub").sum()
+        n_node = (sdf["Type"]=="Node").sum()
 
         st.markdown("---")
         k1,k2,k3,k4,k5 = st.columns(5)
@@ -245,7 +290,6 @@ out center tags;
         with k5: metric_card("Centre", f"{lat:.3f}, {lon:.3f}")
         st.markdown("")
 
-        # Map
         fig_map = go.Figure()
         fig_map.add_trace(go.Scattermapbox(
             lat=[lat], lon=[lon], mode="markers+text",
@@ -257,10 +301,10 @@ out center tags;
         circle_lats, circle_lons = [], []
         for deg in range(0, 361, 4):
             rad = math.radians(deg)
-            dlat = (radius_miles/3958.8) * math.cos(rad)
-            dlon = (radius_miles/3958.8) * math.sin(rad) / math.cos(math.radians(lat))
-            circle_lats.append(lat + math.degrees(dlat))
-            circle_lons.append(lon + math.degrees(dlon))
+            dlat = (radius_miles/3958.8)*math.cos(rad)
+            dlon = (radius_miles/3958.8)*math.sin(rad)/math.cos(math.radians(lat))
+            circle_lats.append(lat+math.degrees(dlat))
+            circle_lons.append(lon+math.degrees(dlon))
         fig_map.add_trace(go.Scattermapbox(
             lat=circle_lats, lon=circle_lons, mode="lines",
             line=dict(color="rgba(255,215,0,0.3)", width=1),
@@ -290,29 +334,22 @@ out center tags;
         )
         st.plotly_chart(fig_map, use_container_width=True)
 
-        # Table + LMP link
         st.markdown('<div class="section-header">Substation List</div>', unsafe_allow_html=True)
-        display_df = sdf.drop(columns=["_id"])
-
         def _style_type(val):
-            if val == "Hub": return "background-color:#3b1f5e;color:#bf7fff;font-weight:600"
+            if val=="Hub": return "background-color:#3b1f5e;color:#bf7fff;font-weight:600"
             return "background-color:#1a3550;color:#4fc3f7;font-weight:600"
-
         st.dataframe(
-            display_df.style.applymap(_style_type, subset=["Type"]),
+            sdf.drop(columns=["_id"]).style.applymap(_style_type, subset=["Type"]),
             use_container_width=True, height=300
         )
 
-        # 🔗 Link to LMP page
         if df is not None:
             st.markdown('<div class="section-header">Link Node to LMP Analysis</div>', unsafe_allow_html=True)
-            st.caption("Select a substation name to pre-fill the LMP Bus selector (partial match)")
             link_node = st.selectbox("Select substation to analyse in LMP", sdf["Name"].tolist(), key="node_link")
             if st.button("📈  Go to LMP Analysis for this Node", type="secondary"):
-                # Try to fuzzy-match to a bus name
-                bus_list = df["Bus"].unique().tolist()
-                keyword = link_node.split()[0].upper() if link_node else ""
-                matched = [b for b in bus_list if keyword in b.upper()]
+                bus_list  = df["Bus"].unique().tolist()
+                keyword   = link_node.split()[0].upper() if link_node else ""
+                matched   = [b for b in bus_list if keyword in b.upper()]
                 st.session_state.selected_bus = matched[0] if matched else bus_list[0]
                 st.info(f"Matched to bus: **{st.session_state.selected_bus}** — switch to 📈 LMP Price Analysis in the sidebar.")
 
@@ -327,41 +364,31 @@ elif page == "📈  LMP Price Analysis":
         st.info("👈  Upload an ERCOT LMP CSV from the sidebar to continue.")
         st.stop()
 
-    # ── Tabs ────────────────────────────────
     tab1, tab2, tab3 = st.tabs(["🔍 Single Bus Analysis", "📊 Top N Buses by Spread", "📥 Export Revenue Table"])
 
-    # ═══ TAB 1 – Single Bus ═══════════════
+    # ═══ TAB 1 – Single Bus ═══════════════════
     with tab1:
         bus_list = sorted(df["Bus"].unique().tolist())
-        default_bus_idx = 0
+        default_idx = 0
         if st.session_state.selected_bus and st.session_state.selected_bus in bus_list:
-            default_bus_idx = bus_list.index(st.session_state.selected_bus)
+            default_idx = bus_list.index(st.session_state.selected_bus)
 
-        bus = st.selectbox("Search & select Bus name", bus_list, index=default_bus_idx)
+        bus = st.selectbox("Search & select Bus name", bus_list, index=default_idx)
         st.session_state.selected_bus = bus
 
         dates = sorted(df["Date"].unique().tolist())
-
-        # Multi-date toggle
         multi_date = st.checkbox("📅 Compare multiple dates on one chart", value=False)
-
         if multi_date:
-            sel_dates = st.multiselect("Select Dates to Compare", dates, default=dates[:min(3,len(dates))])
+            sel_dates = st.multiselect("Select Dates", dates, default=dates[:min(3,len(dates))])
             if not sel_dates:
                 st.warning("Select at least one date.")
                 st.stop()
         else:
-            if len(dates) > 1:
-                sel_date = st.selectbox("Select Date", dates)
-            elif len(dates) == 1:
-                sel_date = dates[0]
-            else:
-                st.error("Could not parse dates from CSV.")
-                st.stop()
+            sel_date  = st.selectbox("Select Date", dates) if len(dates)>1 else dates[0]
             sel_dates = [sel_date]
 
-        show_2hr = st.checkbox("⚡ 2-Hour Storage", value=True)
-        show_4hr = st.checkbox("⚡ 4-Hour Storage", value=True)
+        show_2hr = st.checkbox("⚡ 2-Hour Storage  (3-hr rolling avg, ±1 hr windows)", value=True)
+        show_4hr = st.checkbox("⚡ 4-Hour Storage  (3-hr rolling avg, ±2 hr windows)", value=True)
 
         PALETTE = ["#00d4ff","#ff8c42","#5de0a5","#bf7fff","#FFD700","#ff6b6b","#74c0fc"]
 
@@ -369,171 +396,214 @@ elif page == "📈  LMP Price Analysis":
         summary_rows = []
 
         for di, date in enumerate(sel_dates):
-            bdf = df[(df["Bus"]==bus) & (df["Date"]==date)].sort_values("Hour").reset_index(drop=True)
+            bdf = (df[(df["Bus"]==bus) & (df["Date"]==date)]
+                   .sort_values("Hour").reset_index(drop=True))
             if bdf.empty:
                 continue
 
             col = PALETTE[di % len(PALETTE)]
-            low_i  = bdf["LMP"].idxmin()
-            high_i = bdf["LMP"].idxmax()
-            low_hr  = bdf.loc[low_i, "Hour"]
-            high_hr = bdf.loc[high_i, "Hour"]
+
+            # ── Rolling average & BESS calc ──────
+            rev2, roll2, low2, high2, cw2, dw2 = bess_calc(bdf, half_w=1)
+            rev4, roll4, low4, high4, cw4, dw4 = bess_calc(bdf, half_w=2)
+
             min_lmp = bdf["LMP"].min()
             max_lmp = bdf["LMP"].max()
             spread  = max_lmp - min_lmp
-            rev2, _, _ = bess_revenue(bdf, 1, 1)
-            rev4, _, _ = bess_revenue(bdf, 2, 2)
 
             summary_rows.append({
                 "Date": date, "Bus": bus,
-                "Min LMP": round(min_lmp,2), "Min Hour": low_hr,
-                "Max LMP": round(max_lmp,2), "Max Hour": high_hr,
+                "Min LMP": round(min_lmp,2), "Min Hour": low2,
+                "Max LMP": round(max_lmp,2), "Max Hour": high2,
                 "Spread": round(spread,2),
                 "2H Revenue ($/MWh)": rev2,
                 "4H Revenue ($/MWh)": rev4,
             })
 
-            # LMP line
+            # Raw LMP line
             fig.add_trace(go.Scatter(
                 x=bdf["Hour"], y=bdf["LMP"],
-                name=f"LMP {date}", line=dict(color=col, width=2.5),
+                name=f"LMP {date}",
+                line=dict(color=col, width=2.5),
                 hovertemplate=f"Date: {date}<br>Hour %{{x}}<br>LMP: $%{{y:.2f}}<extra></extra>"
             ))
 
-            # Only overlay BESS bands on single-date mode (to avoid clutter)
+            # BESS overlays — single-date mode only
             if not multi_date:
-                def window(center_hr, hw):
-                    return max(bdf["Hour"].min(), center_hr - hw), min(bdf["Hour"].max(), center_hr + hw)
 
-                c2a, c2b = window(low_hr, 1)
-                d2a, d2b = window(high_hr, 1)
-                c4a, c4b = window(low_hr, 2)
-                d4a, d4b = window(high_hr, 2)
-
+                # ── Rolling average lines ────────
                 if show_2hr:
-                    fig.add_vrect(x0=c2a, x1=c2b, fillcolor="#00e676", opacity=0.10, line_width=0,
-                                  annotation_text="Charge 2H", annotation_font=dict(size=9,color="#00e676"))
-                    fig.add_vrect(x0=d2a, x1=d2b, fillcolor="#ff9800", opacity=0.10, line_width=0,
-                                  annotation_text="Discharge 2H", annotation_font=dict(size=9,color="#ff9800"))
+                    fig.add_trace(go.Scatter(
+                        x=bdf["Hour"], y=roll2,
+                        name="3-hr Roll Avg (2H basis)",
+                        line=dict(color="#00e676", width=1.5, dash="dot"),
+                        hovertemplate="Hour %{x}<br>3-hr Avg: $%{y:.2f}<extra></extra>"
+                    ))
+                if show_4hr and not show_2hr:   # avoid duplicate roll line if both on
+                    fig.add_trace(go.Scatter(
+                        x=bdf["Hour"], y=roll4,
+                        name="3-hr Roll Avg (4H basis)",
+                        line=dict(color="#ff8c42", width=1.5, dash="dot"),
+                        hovertemplate="Hour %{x}<br>3-hr Avg: $%{y:.2f}<extra></extra>"
+                    ))
+
+                # ── 2H shaded windows & band ─────
+                if show_2hr:
+                    fig.add_vrect(x0=cw2[0], x1=cw2[1],
+                                  fillcolor="#00e676", opacity=0.10, line_width=0,
+                                  annotation_text=f"Charge 2H\n(Avg low hr {low2})",
+                                  annotation_font=dict(size=9, color="#00e676"))
+                    fig.add_vrect(x0=dw2[0], x1=dw2[1],
+                                  fillcolor="#ff9800", opacity=0.10, line_width=0,
+                                  annotation_text=f"Discharge 2H\n(Avg high hr {high2})",
+                                  annotation_font=dict(size=9, color="#ff9800"))
                     bdf["_2s"] = bdf["Hour"].apply(
-                        lambda h: -1 if c2a<=h<=c2b else (1 if d2a<=h<=d2b else 0))
+                        lambda h: -1 if cw2[0]<=h<=cw2[1] else (1 if dw2[0]<=h<=dw2[1] else 0))
                     bdf["_2c"] = bdf["LMP"] + bdf["_2s"] * spread * 0.12
-                    fig.add_trace(go.Scatter(x=bdf["Hour"], y=bdf["_2c"],
-                        name="2H Band", line=dict(color="#00e676",width=2,dash="dot",shape="hv"),
-                        hovertemplate="Hour %{x}<br>2H Band: $%{y:.2f}<extra></extra>"))
+                    fig.add_trace(go.Scatter(
+                        x=bdf["Hour"], y=bdf["_2c"],
+                        name="2H Storage Band",
+                        line=dict(color="#00e676", width=2, dash="dashdot", shape="hv"),
+                        hovertemplate="Hour %{x}<br>2H Band: $%{y:.2f}<extra></extra>"
+                    ))
 
+                # ── 4H shaded windows & band ─────
                 if show_4hr:
-                    fig.add_vrect(x0=c4a, x1=c4b, fillcolor="#00bcd4", opacity=0.07, line_width=0,
-                                  annotation_text="Charge 4H", annotation_font=dict(size=9,color="#00bcd4"))
-                    fig.add_vrect(x0=d4a, x1=d4b, fillcolor="#ff5722", opacity=0.07, line_width=0,
-                                  annotation_text="Discharge 4H", annotation_font=dict(size=9,color="#ff5722"))
+                    fig.add_vrect(x0=cw4[0], x1=cw4[1],
+                                  fillcolor="#00bcd4", opacity=0.07, line_width=0,
+                                  annotation_text=f"Charge 4H\n(Avg low hr {low4})",
+                                  annotation_font=dict(size=9, color="#00bcd4"))
+                    fig.add_vrect(x0=dw4[0], x1=dw4[1],
+                                  fillcolor="#ff5722", opacity=0.07, line_width=0,
+                                  annotation_text=f"Discharge 4H\n(Avg high hr {high4})",
+                                  annotation_font=dict(size=9, color="#ff5722"))
                     bdf["_4s"] = bdf["Hour"].apply(
-                        lambda h: -1 if c4a<=h<=c4b else (1 if d4a<=h<=d4b else 0))
+                        lambda h: -1 if cw4[0]<=h<=cw4[1] else (1 if dw4[0]<=h<=dw4[1] else 0))
                     bdf["_4c"] = bdf["LMP"] + bdf["_4s"] * spread * 0.20
-                    fig.add_trace(go.Scatter(x=bdf["Hour"], y=bdf["_4c"],
-                        name="4H Band", line=dict(color="#ff8c42",width=2,dash="dash",shape="hv"),
-                        hovertemplate="Hour %{x}<br>4H Band: $%{y:.2f}<extra></extra>"))
+                    fig.add_trace(go.Scatter(
+                        x=bdf["Hour"], y=bdf["_4c"],
+                        name="4H Storage Band",
+                        line=dict(color="#ff8c42", width=2, dash="dash", shape="hv"),
+                        hovertemplate="Hour %{x}<br>4H Band: $%{y:.2f}<extra></extra>"
+                    ))
 
-                # Min/Max markers
-                fig.add_trace(go.Scatter(
-                    x=[low_hr], y=[min_lmp], mode="markers+text",
-                    marker=dict(size=12,color="#00e676",symbol="triangle-up"),
-                    text=[f"  ${min_lmp:.0f}"], textposition="middle right",
-                    textfont=dict(color="#00e676",size=10), name=f"Min LMP",
-                    hovertemplate=f"Hour {low_hr} — Min: ${min_lmp:.2f}<extra></extra>"
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[high_hr], y=[max_lmp], mode="markers+text",
-                    marker=dict(size=12,color="#ff8c42",symbol="triangle-down"),
-                    text=[f"  ${max_lmp:.0f}"], textposition="middle right",
-                    textfont=dict(color="#ff8c42",size=10), name=f"Max LMP",
-                    hovertemplate=f"Hour {high_hr} — Max: ${max_lmp:.2f}<extra></extra>"
-                ))
+                # ── Markers at rolling-avg peaks ─
+                if show_2hr:
+                    fig.add_trace(go.Scatter(
+                        x=[low2], y=[bdf.loc[bdf["Hour"]==low2, "LMP"].values[0]],
+                        mode="markers+text",
+                        marker=dict(size=13, color="#00e676", symbol="triangle-up"),
+                        text=[f"  Charge\n${roll2.min():.1f} avg"],
+                        textposition="middle right",
+                        textfont=dict(color="#00e676", size=9),
+                        name=f"Avg Low hr {low2}",
+                        hovertemplate=f"Hour {low2} — Roll Avg Min: ${roll2.min():.2f}<extra></extra>"
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=[high2], y=[bdf.loc[bdf["Hour"]==high2, "LMP"].values[0]],
+                        mode="markers+text",
+                        marker=dict(size=13, color="#ff9800", symbol="triangle-down"),
+                        text=[f"  Discharge\n${roll2.max():.1f} avg"],
+                        textposition="middle right",
+                        textfont=dict(color="#ff9800", size=9),
+                        name=f"Avg High hr {high2}",
+                        hovertemplate=f"Hour {high2} — Roll Avg Max: ${roll2.max():.2f}<extra></extra>"
+                    ))
 
         fig.update_layout(
             template="plotly_dark",
-            title=dict(text=f"LMP Intraday Curve — <b>{bus}</b>", font=dict(size=15)),
-            xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1, showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
-            yaxis=dict(title="LMP ($/MWh)", showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
-            legend=dict(orientation="h", y=1.08, x=0, bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
-            hovermode="x unified", height=500
+            title=dict(text=f"LMP & Rolling-Average BESS Strategy — <b>{bus}</b>", font=dict(size=15)),
+            xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1,
+                       showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+            yaxis=dict(title="LMP ($/MWh)",
+                       showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+            legend=dict(orientation="h", y=1.10, x=0,
+                        bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
+            hovermode="x unified", height=530
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Summary KPIs
+        # ── Legend explainer ────────────────────
+        with st.expander("ℹ️  How the rolling-average BESS strategy works"):
+            st.markdown("""
+**Step 1 — Smooth the price curve**
+A **3-hour centred rolling average** is calculated across all 24 hours:
+`Roll[h] = mean(LMP[h-1], LMP[h], LMP[h+1])`
+This removes single-hour price spikes that would be impractical to capture.
+
+**Step 2 — Find the smoothed low & high**
+- The hour with the **lowest** rolling average → optimal charge centre
+- The hour with the **highest** rolling average → optimal discharge centre
+
+**Step 3 — Set the windows**
+| Storage | Charge window | Discharge window |
+|---------|--------------|-----------------|
+| 2H BESS | ±1 hr around avg-low | ±1 hr around avg-high |
+| 4H BESS | ±2 hr around avg-low | ±2 hr around avg-high |
+
+**Revenue** = average LMP during discharge window − average LMP during charge window
+            """)
+
+        # KPIs
         if summary_rows:
-            srow = summary_rows[0]
+            sr = summary_rows[0]
             k1,k2,k3,k4,k5 = st.columns(5)
             with k1: metric_card("Bus", bus)
-            with k2: metric_card("Lowest LMP",  f"${srow['Min LMP']:.2f}", f"Hour {srow['Min Hour']}")
-            with k3: metric_card("Highest LMP", f"${srow['Max LMP']:.2f}", f"Hour {srow['Max Hour']}")
-            with k4: metric_card("2H Arbitrage", f"${srow['2H Revenue ($/MWh)']:.2f}", "$/MWh net")
-            with k5: metric_card("4H Arbitrage", f"${srow['4H Revenue ($/MWh)']:.2f}", "$/MWh net")
+            with k2: metric_card("Lowest LMP",   f"${sr['Min LMP']:.2f}",  f"Hour {sr['Min Hour']}")
+            with k3: metric_card("Highest LMP",  f"${sr['Max LMP']:.2f}",  f"Hour {sr['Max Hour']}")
+            with k4: metric_card("2H Arbitrage", f"${sr['2H Revenue ($/MWh)']:.2f}", "$/MWh net")
+            with k5: metric_card("4H Arbitrage", f"${sr['4H Revenue ($/MWh)']:.2f}", "$/MWh net")
             st.markdown("")
-            spread_val = srow["Spread"]
-            if spread_val > 80:   st.success("✅  Pure Merchant Arbitrage Opportunity")
-            elif spread_val > 40: st.warning("⚠️  Solar + Storage Overbuild Recommended")
-            else:                 st.error("❌  Low Spread → Capacity / Ancillary Market Focus")
+            sp = sr["Spread"]
+            if sp > 80:   st.success("✅  Pure Merchant Arbitrage Opportunity")
+            elif sp > 40: st.warning("⚠️  Solar + Storage Overbuild Recommended")
+            else:         st.error("❌  Low Spread → Capacity / Ancillary Market Focus")
 
         if multi_date and summary_rows:
             st.markdown("---")
             st.markdown('<div class="section-header">Multi-Date Summary</div>', unsafe_allow_html=True)
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
-    # ═══ TAB 2 – Top N Buses ═════════════
+    # ═══ TAB 2 – Top N Buses ══════════════════
     with tab2:
         st.markdown('<div class="section-header">Top N Buses by LMP Spread</div>', unsafe_allow_html=True)
-
         dates_all = sorted(df["Date"].unique().tolist())
         c1, c2 = st.columns(2)
-        with c1:
-            top_n = st.slider("Show Top N Buses", 5, 50, 15)
+        with c1: top_n = st.slider("Show Top N Buses", 5, 50, 15)
         with c2:
-            if len(dates_all) > 1:
-                top_date = st.selectbox("For Date", dates_all, key="top_date")
-            else:
-                top_date = dates_all[0]
-                st.markdown(f"**Date:** {top_date}")
+            top_date = st.selectbox("For Date", dates_all, key="top_date") if len(dates_all)>1 else dates_all[0]
 
-        filt = df[df["Date"] == top_date]
+        filt = df[df["Date"]==top_date]
         bus_stats = (
             filt.groupby("Bus")["LMP"]
-            .agg(Min_LMP="min", Max_LMP="max",
-                 Avg_LMP="mean", Std_Dev="std",
-                 Spread=lambda x: x.max()-x.min())
+            .agg(Min_LMP="min", Max_LMP="max", Avg_LMP="mean",
+                 Std_Dev="std", Spread=lambda x: x.max()-x.min())
             .round(2).reset_index()
             .sort_values("Spread", ascending=False)
             .head(top_n)
         )
-
-        # Compute BESS revenue for each top bus
         rev_rows = []
         for _, row in bus_stats.iterrows():
             bdf_t = filt[filt["Bus"]==row["Bus"]].sort_values("Hour").reset_index(drop=True)
-            r2, lh2, hh2 = bess_revenue(bdf_t, 1, 1)
-            r4, lh4, hh4 = bess_revenue(bdf_t, 2, 2)
-            rev_rows.append({"Bus": row["Bus"], "2H Rev":r2, "4H Rev":r4,
-                             "Low Hr":lh2, "High Hr":hh2})
-        rev_df = pd.DataFrame(rev_rows)
-        top_df = bus_stats.merge(rev_df, on="Bus")
+            r2, _, lh2, hh2, _, _ = bess_calc(bdf_t, 1)
+            r4, _, lh4, hh4, _, _ = bess_calc(bdf_t, 2)
+            rev_rows.append({"Bus":row["Bus"],"2H Rev":r2,"4H Rev":r4,
+                             "Low Hr":lh2,"High Hr":hh2})
+        top_df = bus_stats.merge(pd.DataFrame(rev_rows), on="Bus")
 
-        # Bar chart
         fig_top = px.bar(
-            top_df, x="Bus", y="Spread",
-            color="Spread",
+            top_df, x="Bus", y="Spread", color="Spread",
             color_continuous_scale=["#f07070","#f0c040","#5de0a5"],
-            labels={"Spread":"LMP Spread ($/MWh)"},
-            template="plotly_dark",
+            labels={"Spread":"LMP Spread ($/MWh)"}, template="plotly_dark",
             title=f"Top {top_n} Buses by LMP Spread — {top_date}"
         )
         fig_top.update_layout(xaxis_tickangle=-40, coloraxis_showscale=False, height=420)
         st.plotly_chart(fig_top, use_container_width=True)
 
-        # Scatter: Spread vs 4H Revenue
         fig_sc = px.scatter(
             top_df, x="Spread", y="4H Rev", text="Bus", size="Spread",
             color="4H Rev", color_continuous_scale=["#4fc3f7","#bf7fff","#ff8c42"],
-            template="plotly_dark", title="Spread vs 4H BESS Revenue",
+            template="plotly_dark", title="Spread vs 4H BESS Revenue (Rolling-Avg Strategy)",
             labels={"Spread":"LMP Spread ($/MWh)","4H Rev":"4H Revenue ($/MWh)"}
         )
         fig_sc.update_traces(textposition="top center", textfont=dict(size=8))
@@ -541,69 +611,63 @@ elif page == "📈  LMP Price Analysis":
         st.plotly_chart(fig_sc, use_container_width=True)
 
         def _style_spread(val):
-            if val > 80: return "background-color:#1f4b2e;color:#5de0a5"
-            if val > 40: return "background-color:#3d3510;color:#f0c040"
+            if val>80:  return "background-color:#1f4b2e;color:#5de0a5"
+            if val>40:  return "background-color:#3d3510;color:#f0c040"
             return "background-color:#2e1a1a;color:#f07070"
-
         st.dataframe(
             top_df.style.applymap(_style_spread, subset=["Spread"]),
             use_container_width=True, height=320
         )
-
-        # Quick-select best bus
         if not top_df.empty:
             best_bus = top_df.iloc[0]["Bus"]
-            if st.button(f"📈  Analyse #{1} Bus: {best_bus} in Single Bus tab"):
+            if st.button(f"📈  Analyse top bus: {best_bus}"):
                 st.session_state.selected_bus = best_bus
-                st.info(f"Switched to **{best_bus}** — click the 'Single Bus Analysis' tab above.")
+                st.info(f"Switched to **{best_bus}** — click the 'Single Bus Analysis' tab.")
 
-    # ═══ TAB 3 – Export ══════════════════
+    # ═══ TAB 3 – Export ═══════════════════════
     with tab3:
         st.markdown('<div class="section-header">Export BESS Revenue for All Buses</div>', unsafe_allow_html=True)
-
         dates_exp = sorted(df["Date"].unique().tolist())
-        if len(dates_exp) > 1:
-            exp_date = st.selectbox("Select Date for Export", dates_exp, key="exp_date")
-        else:
-            exp_date = dates_exp[0]
+        exp_date  = st.selectbox("Select Date for Export", dates_exp, key="exp_date") if len(dates_exp)>1 else dates_exp[0]
 
         if st.button("⚙️  Compute Revenue for All Buses", type="primary"):
-            with st.spinner("Calculating …"):
+            with st.spinner("Calculating rolling-average BESS revenue for all buses …"):
                 exp_rows = []
                 for bus_name in df["Bus"].unique():
-                    bdf_e = df[(df["Bus"]==bus_name) & (df["Date"]==exp_date)].sort_values("Hour").reset_index(drop=True)
-                    if bdf_e.empty or len(bdf_e) < 3:
+                    bdf_e = (df[(df["Bus"]==bus_name) & (df["Date"]==exp_date)]
+                             .sort_values("Hour").reset_index(drop=True))
+                    if len(bdf_e) < 3:
                         continue
-                    r2, lh, hh = bess_revenue(bdf_e, 1, 1)
-                    r4, _,  __  = bess_revenue(bdf_e, 2, 2)
+                    r2, _, lh, hh, cw2, dw2 = bess_calc(bdf_e, 1)
+                    r4, _, _,  _,  cw4, dw4 = bess_calc(bdf_e, 2)
                     sp = round(bdf_e["LMP"].max() - bdf_e["LMP"].min(), 2)
-                    if sp > 80:   rec = "Merchant Arbitrage"
-                    elif sp > 40: rec = "Solar + Storage Overbuild"
-                    else:         rec = "Ancillary / Capacity"
+                    rec = ("Merchant Arbitrage" if sp>80
+                           else ("Solar + Storage Overbuild" if sp>40 else "Ancillary / Capacity"))
                     exp_rows.append({
                         "Date": exp_date, "Bus": bus_name,
                         "Min LMP": round(bdf_e["LMP"].min(),2),
                         "Max LMP": round(bdf_e["LMP"].max(),2),
                         "Avg LMP": round(bdf_e["LMP"].mean(),2),
                         "Spread ($/MWh)": sp,
-                        "Low Price Hour": lh,
-                        "High Price Hour": hh,
+                        "2H Charge Window":    f"Hr {cw2[0]:.0f}–{cw2[1]:.0f}",
+                        "2H Discharge Window": f"Hr {dw2[0]:.0f}–{dw2[1]:.0f}",
+                        "4H Charge Window":    f"Hr {cw4[0]:.0f}–{cw4[1]:.0f}",
+                        "4H Discharge Window": f"Hr {dw4[0]:.0f}–{dw4[1]:.0f}",
                         "2H Revenue ($/MWh)": r2,
                         "4H Revenue ($/MWh)": r4,
                         "Recommended Strategy": rec,
                     })
 
-            exp_df = pd.DataFrame(exp_rows).sort_values("Spread ($/MWh)", ascending=False).reset_index(drop=True)
+            exp_df = (pd.DataFrame(exp_rows)
+                      .sort_values("Spread ($/MWh)", ascending=False)
+                      .reset_index(drop=True))
             st.success(f"✅  Computed {len(exp_df)} buses")
             st.dataframe(exp_df, use_container_width=True, height=400)
-
-            csv_bytes = exp_df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 label="📥  Download CSV",
-                data=csv_bytes,
+                data=exp_df.to_csv(index=False).encode("utf-8"),
                 file_name=f"BESS_Revenue_{exp_date}.csv",
-                mime="text/csv",
-                type="primary"
+                mime="text/csv", type="primary"
             )
 
 
@@ -614,7 +678,6 @@ elif page == "🤖  AI Copilot":
     st.title("🤖  AI Copilot")
     st.caption("Ask questions about your LMP data. Powered by Claude (Anthropic).")
 
-    # API Key input
     with st.sidebar:
         st.markdown("---")
         st.markdown("### 🔑 Anthropic API Key")
@@ -626,9 +689,8 @@ elif page == "🤖  AI Copilot":
         st.markdown("""
         **How to get a key:**
         1. Go to [console.anthropic.com](https://console.anthropic.com)
-        2. Sign up / log in
-        3. Navigate to **API Keys** → Create new key
-        4. Paste it in the sidebar
+        2. Sign up / log in → **API Keys** → Create new key
+        3. Paste it in the sidebar
         """)
         st.stop()
 
@@ -636,8 +698,8 @@ elif page == "🤖  AI Copilot":
         st.info("👈  Upload an ERCOT LMP CSV from the sidebar first.")
         st.stop()
 
-    # ── Build data context ───────────────────
-    dates_ai = sorted(df["Date"].unique().tolist())
+    # Build data context
+    dates_ai   = sorted(df["Date"].unique().tolist())
     bus_list_ai = sorted(df["Bus"].unique().tolist())
     top_buses_ai = (
         df.groupby("Bus")["LMP"]
@@ -645,48 +707,44 @@ elif page == "🤖  AI Copilot":
         .sort_values("spread", ascending=False)
         .head(10).round(2).reset_index()
     )
-
     data_context = f"""
 You are an expert ERCOT energy market analyst and BESS (Battery Energy Storage System) strategy advisor.
 
-The user has uploaded an ERCOT LMP dataset with the following characteristics:
+The user has uploaded an ERCOT LMP dataset:
 - Dates: {", ".join(dates_ai)}
 - Total buses/nodes: {len(bus_list_ai)}
 - Total records: {len(df):,}
 - Overall avg LMP: ${df['LMP'].mean():.2f}/MWh
-- Overall max LMP: ${df['LMP'].max():.2f}/MWh (Bus: {df.loc[df['LMP'].idxmax(),'Bus']})
-- Overall min LMP: ${df['LMP'].min():.2f}/MWh (Bus: {df.loc[df['LMP'].idxmin(),'Bus']})
+- Overall max LMP: ${df['LMP'].max():.2f}/MWh  (Bus: {df.loc[df['LMP'].idxmax(),'Bus']})
+- Overall min LMP: ${df['LMP'].min():.2f}/MWh  (Bus: {df.loc[df['LMP'].idxmin(),'Bus']})
 
 Top 10 buses by LMP Spread:
 {top_buses_ai.to_string(index=False)}
 
-BESS Strategy thresholds used:
-- Spread > $80/MWh → Pure Merchant Arbitrage
-- Spread $40–$80/MWh → Solar + Storage Overbuild
-- Spread < $40/MWh → Capacity / Ancillary Market Focus
+BESS Strategy used in this dashboard:
+- A 3-hour centred rolling average smooths the price curve before finding optimal charge/discharge hours.
+- 2H BESS: charges ±1 hr around smoothed price minimum; discharges ±1 hr around smoothed maximum.
+- 4H BESS: charges ±2 hr around smoothed price minimum; discharges ±2 hr around smoothed maximum.
+- Revenue = avg discharge LMP − avg charge LMP.
 
-2H BESS: charges 1 hour before/after the daily price minimum, discharges 1 hour before/after the daily maximum.
-4H BESS: charges 2 hours before/after the daily price minimum, discharges 2 hours before/after the daily maximum.
+Strategy thresholds:
+- Spread > $80/MWh  → Pure Merchant Arbitrage
+- Spread $40–80/MWh → Solar + Storage Overbuild
+- Spread < $40/MWh  → Capacity / Ancillary Market Focus
 
-Answer all questions concisely and in the context of ERCOT energy markets and BESS development strategy.
-Always be specific using the numbers from the dataset above.
+Answer concisely and specifically using numbers from the dataset. Focus on actionable BESS development insights.
 """
 
-    # ── Chat history ─────────────────────────
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-
-    # Suggested prompts
     st.markdown('<div class="section-header">Suggested Questions</div>', unsafe_allow_html=True)
-    q_cols = st.columns(3)
     suggestions = [
         "Which buses have the best arbitrage opportunity?",
         "What is the recommended BESS strategy for the top bus?",
         "Summarise the overall LMP price trends in this dataset",
         "Which hours have the highest and lowest average prices?",
-        "Compare 2H vs 4H storage economics for top nodes",
+        "Compare 2H vs 4H storage economics for the top nodes",
         "What does the spread distribution suggest about market volatility?",
     ]
+    q_cols = st.columns(3)
     for i, q in enumerate(suggestions):
         with q_cols[i % 3]:
             if st.button(q, key=f"sugg_{i}", use_container_width=True):
@@ -694,46 +752,34 @@ Always be specific using the numbers from the dataset above.
 
     st.markdown("---")
 
-    # Chat input
     user_input = st.chat_input("Ask anything about your ERCOT LMP data …")
     if user_input:
         st.session_state.chat_history.append({"role":"user","content":user_input})
 
-    # Display history + call API for last unanswered message
     for i, msg in enumerate(st.session_state.chat_history):
         with st.chat_message("user" if msg["role"]=="user" else "assistant",
                              avatar="👤" if msg["role"]=="user" else "🤖"):
             st.markdown(msg["content"])
 
-        # If this is the last message and it's from user, generate response
-        if msg["role"] == "user" and i == len(st.session_state.chat_history) - 1:
+        if msg["role"] == "user" and i == len(st.session_state.chat_history)-1:
             with st.chat_message("assistant", avatar="🤖"):
                 with st.spinner("Analysing …"):
-                    messages_payload = [{"role":"user","content":data_context + "\n\n---\n\nUser question: " + st.session_state.chat_history[0]["content"]}]
+                    msgs_payload = [{"role":"user","content": data_context+"\n\n---\n\nUser question: "+st.session_state.chat_history[0]["content"]}]
                     for h in st.session_state.chat_history[1:]:
-                        messages_payload.append({"role": h["role"], "content": h["content"]})
+                        msgs_payload.append({"role":h["role"],"content":h["content"]})
                     try:
                         ai_resp = requests.post(
                             "https://api.anthropic.com/v1/messages",
-                            headers={
-                                "x-api-key": api_key,
-                                "anthropic-version": "2023-06-01",
-                                "content-type": "application/json"
-                            },
-                            json={
-                                "model": "claude-sonnet-4-20250514",
-                                "max_tokens": 1024,
-                                "messages": messages_payload
-                            },
+                            headers={"x-api-key":api_key,"anthropic-version":"2023-06-01","content-type":"application/json"},
+                            json={"model":"claude-sonnet-4-20250514","max_tokens":1024,"messages":msgs_payload},
                             timeout=30
                         )
                         ai_resp.raise_for_status()
                         answer = ai_resp.json()["content"][0]["text"]
-                    except requests.exceptions.HTTPError as e:
+                    except requests.exceptions.HTTPError:
                         answer = f"❌ API error {ai_resp.status_code}: {ai_resp.text}"
                     except Exception as e:
                         answer = f"❌ Error: {str(e)}"
-
                     st.markdown(answer)
                     st.session_state.chat_history.append({"role":"assistant","content":answer})
 
