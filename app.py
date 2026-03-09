@@ -343,6 +343,121 @@ out center tags;
             use_container_width=True, height=300
         )
 
+        # ── Real-Time LMP from ERCOT public API ──
+        st.markdown("---")
+        st.markdown('<div class="section-header">⚡ Real-Time LMP for Selected Substation</div>', unsafe_allow_html=True)
+
+        sel_sub = st.selectbox("Select Substation", sdf["Name"].tolist(), key="rtlmp_sub")
+
+        # Let user override/confirm the ERCOT settlement point name
+        st.caption("ERCOT settlement point names may differ from OSM names. Edit below if needed.")
+        sp_guess = sel_sub.upper().replace(" ","_").replace("-","_")[:20]
+        settlement_point = st.text_input("ERCOT Settlement Point Name", value=sp_guess,
+                                         help="Must match an ERCOT bus/hub name exactly e.g. HB_NORTH, LZ_HOUSTON")
+
+        fetch_rt = st.button("📡  Fetch Real-Time LMP", type="primary")
+
+        if fetch_rt and settlement_point.strip():
+            from datetime import datetime, timedelta, timezone
+            now_utc   = datetime.now(timezone.utc)
+            # ERCOT SCED runs every 5 min; pull last 2 hours
+            ts_from   = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+            ts_to     = now_utc.strftime("%Y-%m-%dT%H:%M:%S")
+            sp_clean  = settlement_point.strip()
+
+            ercot_url = "https://api.ercot.com/api/public-reports/np6-788-er"
+            params    = {
+                "SCEDTimestampFrom": ts_from,
+                "SCEDTimestampTo":   ts_to,
+                "settlementPoint":   sp_clean,
+                "size": 200,
+            }
+            headers = {"Ocp-Apim-Subscription-Key": "", "accept": "application/json"}
+
+            with st.spinner(f"Fetching real-time LMP for {sp_clean} from ERCOT …"):
+                try:
+                    rt_resp = requests.get(ercot_url, params=params, timeout=20)
+                    rt_resp.raise_for_status()
+                    rt_json = rt_resp.json()
+
+                    # ERCOT API returns data under 'data' key as list of lists
+                    fields  = [f["name"] for f in rt_json.get("fields", [])]
+                    records = rt_json.get("data", [])
+
+                    if not records:
+                        st.warning(f"No real-time data returned for **{sp_clean}**. "
+                                   "Check the settlement point name matches an ERCOT bus exactly (e.g. HB_NORTH, LZ_WEST).")
+                    else:
+                        rt_df = pd.DataFrame(records, columns=fields)
+
+                        # Normalise column names
+                        rt_df.columns = [c.strip() for c in rt_df.columns]
+                        ts_col  = next((c for c in rt_df.columns if "timestamp" in c.lower() or "time" in c.lower()), rt_df.columns[0])
+                        lmp_col = next((c for c in rt_df.columns if "lmp" in c.lower() or "price" in c.lower()), rt_df.columns[-1])
+
+                        rt_df[ts_col]  = pd.to_datetime(rt_df[ts_col], errors="coerce")
+                        rt_df[lmp_col] = pd.to_numeric(rt_df[lmp_col], errors="coerce")
+                        rt_df = rt_df.dropna(subset=[ts_col, lmp_col]).sort_values(ts_col)
+
+                        latest_lmp  = rt_df[lmp_col].iloc[-1]
+                        latest_time = rt_df[ts_col].iloc[-1].strftime("%H:%M UTC")
+                        avg_lmp     = round(rt_df[lmp_col].mean(), 2)
+                        max_lmp     = round(rt_df[lmp_col].max(), 2)
+                        min_lmp     = round(rt_df[lmp_col].min(), 2)
+
+                        # Store for AI summary context
+                        st.session_state["rt_summary"] = {
+                            "sp": sp_clean, "latest": latest_lmp,
+                            "avg": avg_lmp, "max": max_lmp, "min": min_lmp
+                        }
+                        # Clear old AI summary so it regenerates with new LMP data
+                        st.session_state["node_ai_summary"] = ""
+
+                        k1,k2,k3,k4 = st.columns(4)
+                        with k1: metric_card("Latest LMP",  f"${latest_lmp:.2f}", f"as of {latest_time}")
+                        with k2: metric_card("2H Avg LMP",  f"${avg_lmp:.2f}",    "$/MWh")
+                        with k3: metric_card("2H Max LMP",  f"${max_lmp:.2f}",    "$/MWh")
+                        with k4: metric_card("2H Min LMP",  f"${min_lmp:.2f}",    "$/MWh")
+                        st.markdown("")
+
+                        fig_rt = go.Figure()
+                        fig_rt.add_trace(go.Scatter(
+                            x=rt_df[ts_col], y=rt_df[lmp_col],
+                            mode="lines+markers",
+                            line=dict(color="#00d4ff", width=2),
+                            marker=dict(size=5),
+                            name="Real-Time LMP",
+                            hovertemplate="%{x|%H:%M}<br>LMP: $%{y:.2f}/MWh<extra></extra>"
+                        ))
+                        fig_rt.add_hline(
+                            y=avg_lmp, line_dash="dot", line_color="#5de0a5",
+                            annotation_text=f"2H Avg ${avg_lmp:.2f}",
+                            annotation_font=dict(color="#5de0a5", size=10)
+                        )
+                        fig_rt.update_layout(
+                            template="plotly_dark",
+                            title=f"Real-Time LMP — {sp_clean}  (Last 2 Hours)",
+                            xaxis_title="Time (UTC)",
+                            yaxis_title="LMP ($/MWh)",
+                            height=380,
+                            margin=dict(t=50)
+                        )
+                        st.plotly_chart(fig_rt, use_container_width=True)
+
+                        with st.expander("📄 Raw real-time data"):
+                            st.dataframe(rt_df[[ts_col, lmp_col]].rename(
+                                columns={ts_col:"Timestamp (UTC)", lmp_col:"LMP ($/MWh)"}),
+                                use_container_width=True)
+
+                except requests.exceptions.HTTPError as e:
+                    st.error(f"ERCOT API returned an error: {rt_resp.status_code}. "
+                             "The settlement point name may not exist or the API is temporarily unavailable.")
+                    with st.expander("Debug info"):
+                        st.code(rt_resp.text[:500])
+                except Exception as e:
+                    st.error(f"Could not fetch real-time data: {e}")
+
+        st.markdown("---")
         if df is not None:
             st.markdown('<div class="section-header">Link Node to LMP Analysis</div>', unsafe_allow_html=True)
             link_node = st.selectbox("Select substation to analyse in LMP", sdf["Name"].tolist(), key="node_link")
@@ -352,6 +467,116 @@ out center tags;
                 matched   = [b for b in bus_list if keyword in b.upper()]
                 st.session_state.selected_bus = matched[0] if matched else bus_list[0]
                 st.info(f"Matched to bus: **{st.session_state.selected_bus}** — switch to 📈 LMP Price Analysis in the sidebar.")
+
+        # ── AI Workflow Summary ───────────────────
+        st.markdown("---")
+        st.markdown('<div class="section-header">🤖 AI Node & LMP Summary</div>', unsafe_allow_html=True)
+
+        # Pull API key from sidebar session
+        ai_key = st.session_state.get("api_key", "")
+
+        if not ai_key:
+            st.info("🔑 Enter your Anthropic API key in the sidebar to enable the AI summary.")
+        else:
+            # Build a rich context from everything currently on screen
+            nearest_5 = sdf.head(5)[["Name","Type","Voltage","Distance (mi)","Operator"]].to_string(index=False)
+            hub_list   = sdf[sdf["Type"]=="Hub"][["Name","Voltage","Distance (mi)"]].head(5).to_string(index=False)
+            node_list  = sdf[sdf["Type"]=="Node"][["Name","Voltage","Distance (mi)"]].head(5).to_string(index=False)
+            volt_dist  = sdf["Voltage"].value_counts().to_string()
+
+            # Include RT LMP if it was fetched this session
+            rt_lmp_context = ""
+            if "rt_summary" in st.session_state and st.session_state.rt_summary:
+                rt_lmp_context = f"""
+Real-Time LMP Data (last fetched):
+- Settlement Point: {st.session_state.rt_summary.get('sp','')}
+- Latest LMP:  ${st.session_state.rt_summary.get('latest',0):.2f}/MWh
+- 2H Average:  ${st.session_state.rt_summary.get('avg',0):.2f}/MWh
+- 2H Max:      ${st.session_state.rt_summary.get('max',0):.2f}/MWh
+- 2H Min:      ${st.session_state.rt_summary.get('min',0):.2f}/MWh
+"""
+
+            screen_context = f"""
+You are an expert ERCOT energy market analyst and BESS developer advisor.
+
+The user has just run a substation search on the ERCOT BESS Dashboard.
+Summarise what is currently on the screen in a clear, professional manner.
+
+=== SEARCH PARAMETERS ===
+Centre coordinates: {lat:.4f}, {lon:.4f}
+Search radius: {radius_miles} miles
+Hub threshold: ≥ {hub_threshold_kv} kV
+Total substations found: {len(sdf)}
+  - Hubs:  {n_hub}
+  - Nodes: {n_node}
+
+=== NEAREST 5 SUBSTATIONS ===
+{nearest_5}
+
+=== NEAREST HUBS (≥{hub_threshold_kv} kV) ===
+{hub_list if n_hub > 0 else "None found"}
+
+=== NEAREST NODES (<{hub_threshold_kv} kV) ===
+{node_list if n_node > 0 else "None found"}
+
+=== VOLTAGE DISTRIBUTION ===
+{volt_dist}
+{rt_lmp_context}
+
+=== YOUR TASK ===
+Write a structured summary (use short sections with emoji headers) covering:
+1. What substations were found and their significance
+2. The nearest Hub — its name, voltage, distance, and why it matters for BESS interconnection
+3. The nearest Node — its name, voltage, distance, and role in the local grid
+4. The voltage mix in this area and what it tells us about grid density
+5. If real-time LMP data is available — interpret the current price level and what it signals for BESS dispatch right now
+6. A brief developer recommendation — is this a good area for BESS development based on grid infrastructure?
+
+Be specific, use the actual numbers from the data, and keep each section to 2–3 sentences.
+"""
+
+            auto_run = st.checkbox("⚡ Auto-generate summary after search", value=True, key="auto_ai")
+
+            if auto_run or st.button("🤖  Generate AI Summary", type="primary", key="gen_ai"):
+                with st.spinner("AI is analysing the screen …"):
+                    try:
+                        ai_r = requests.post(
+                            "https://api.anthropic.com/v1/messages",
+                            headers={
+                                "x-api-key": ai_key,
+                                "anthropic-version": "2023-06-01",
+                                "content-type": "application/json"
+                            },
+                            json={
+                                "model": "claude-sonnet-4-20250514",
+                                "max_tokens": 900,
+                                "messages": [{"role": "user", "content": screen_context}]
+                            },
+                            timeout=30
+                        )
+                        ai_r.raise_for_status()
+                        summary = ai_r.json()["content"][0]["text"]
+                        st.session_state["node_ai_summary"] = summary
+                    except requests.exceptions.HTTPError:
+                        st.error(f"API error {ai_r.status_code}: {ai_r.text[:200]}")
+                    except Exception as e:
+                        st.error(f"AI summary failed: {e}")
+
+            # Display persisted summary
+            if "node_ai_summary" in st.session_state and st.session_state.node_ai_summary:
+                st.markdown("""
+                <div style="background:#0f1a14;border:1px solid #2a4a35;border-radius:12px;
+                            padding:20px 24px;margin-top:10px;">
+                """, unsafe_allow_html=True)
+                st.markdown(st.session_state.node_ai_summary)
+                st.markdown("</div>", unsafe_allow_html=True)
+                st.caption("💡 Summary generated by Claude · based on current screen data")
+
+                col_copy, col_clear = st.columns([1,5])
+                with col_copy:
+                    if st.button("🗑️ Clear", key="clear_node_ai"):
+                        st.session_state.node_ai_summary = ""
+                        st.rerun()
 
 
 # ══════════════════════════════════════════════
@@ -683,6 +908,7 @@ elif page == "🤖  AI Copilot":
         st.markdown("### 🔑 Anthropic API Key")
         api_key = st.text_input("Enter API Key", type="password", key="api_key",
                                 help="Get your key at console.anthropic.com")
+        st.markdown("*Used for AI Copilot & Node AI Summary*")
 
     if not api_key:
         st.warning("Enter your Anthropic API key in the sidebar to activate the AI Copilot.")
