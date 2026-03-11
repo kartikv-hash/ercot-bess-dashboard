@@ -26,17 +26,54 @@ SECOND_APP_URL = "https://fatal-flaw-o7aks4agtoffgyydbvrguj.streamlit.app/"
 #  HARDCODED SETTLEMENT POINTS CSV
 # ─────────────────────────────────────────────
 _CSV_NAME = "Settlement_Points_02202026_094122.csv"
-# Try multiple paths: same dir as script, repo root, current working directory
-_candidates = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), _CSV_NAME),
-    os.path.join(os.getcwd(), _CSV_NAME),
-    _CSV_NAME,
-]
-SETTLEMENT_CSV_PATH = next((p for p in _candidates if os.path.isfile(p)), _candidates[0])
+
+def _find_csv():
+    """Search common Streamlit Cloud paths for the settlement CSV."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), _CSV_NAME),
+        os.path.join(os.getcwd(), _CSV_NAME),
+        _CSV_NAME,
+        f"/mount/src/ercot-bess-dashboard/{_CSV_NAME}",
+        f"/app/ercot-bess-dashboard/{_CSV_NAME}",
+        f"/home/appuser/ercot-bess-dashboard/{_CSV_NAME}",
+    ]
+    # Also walk one level from cwd and script dir
+    for base in [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]:
+        try:
+            for item in os.listdir(base):
+                full = os.path.join(base, item)
+                if os.path.isfile(full) and item == _CSV_NAME:
+                    candidates.insert(0, full)
+                elif os.path.isdir(full):
+                    sub = os.path.join(full, _CSV_NAME)
+                    if os.path.isfile(sub):
+                        candidates.insert(0, sub)
+        except Exception:
+            pass
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+SETTLEMENT_CSV_PATH = _find_csv()
 
 @st.cache_data
 def load_settlement_points():
     """Load the ERCOT settlement points master CSV (bundled with app)."""
+    if SETTLEMENT_CSV_PATH is None:
+        # Show debug info to help locate the file
+        import glob
+        cwd = os.getcwd()
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        csv_files = glob.glob(os.path.join(cwd, "**/*.csv"), recursive=True)
+        st.sidebar.warning(
+            f"**CSV Debug Info**\n\n"
+            f"- CWD: `{cwd}`\n"
+            f"- Script dir: `{script_dir}`\n"
+            f"- CSV files found:\n" +
+            "\n".join([f"  - `{f}`" for f in csv_files[:10]]) if csv_files else "  - None"
+        )
+        return None
     try:
         sp = pd.read_csv(SETTLEMENT_CSV_PATH)
         sp.columns = [c.strip() for c in sp.columns]
