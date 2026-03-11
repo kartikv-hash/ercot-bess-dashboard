@@ -25,7 +25,14 @@ SECOND_APP_URL = "https://fatal-flaw-o7aks4agtoffgyydbvrguj.streamlit.app/"
 # ─────────────────────────────────────────────
 #  HARDCODED SETTLEMENT POINTS CSV
 # ─────────────────────────────────────────────
-SETTLEMENT_CSV_PATH = os.path.join(os.path.dirname(__file__), "Settlement_Points_02202026_094122.csv")
+_CSV_NAME = "Settlement_Points_02202026_094122.csv"
+# Try multiple paths: same dir as script, repo root, current working directory
+_candidates = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), _CSV_NAME),
+    os.path.join(os.getcwd(), _CSV_NAME),
+    _CSV_NAME,
+]
+SETTLEMENT_CSV_PATH = next((p for p in _candidates if os.path.isfile(p)), _candidates[0])
 
 @st.cache_data
 def load_settlement_points():
