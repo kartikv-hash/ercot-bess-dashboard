@@ -6,6 +6,7 @@ import numpy as np
 import requests
 import math
 import io
+import os
 
 # ─────────────────────────────────────────────
 #  PAGE CONFIG
@@ -20,6 +21,84 @@ if "lmp_df"         not in st.session_state: st.session_state.lmp_df         = N
 if "chat_history"   not in st.session_state: st.session_state.chat_history   = []
 
 SECOND_APP_URL = "https://fatal-flaw-o7aks4agtoffgyydbvrguj.streamlit.app/"
+
+# ─────────────────────────────────────────────
+#  HARDCODED SETTLEMENT POINTS CSV
+# ─────────────────────────────────────────────
+SETTLEMENT_CSV_PATH = os.path.join(os.path.dirname(__file__), "Settlement_Points_02202026_094122.csv")
+
+@st.cache_data
+def load_settlement_points():
+    """Load the ERCOT settlement points master CSV (bundled with app)."""
+    try:
+        sp = pd.read_csv(SETTLEMENT_CSV_PATH)
+        sp.columns = [c.strip() for c in sp.columns]
+        # Normalise key columns
+        sp["SUBSTATION"] = sp["SUBSTATION"].astype(str).str.strip().str.upper()
+        sp["ELECTRICAL_BUS"] = sp["ELECTRICAL_BUS"].astype(str).str.strip()
+        sp["SETTLEMENT_LOAD_ZONE"] = sp["SETTLEMENT_LOAD_ZONE"].astype(str).str.strip()
+        sp["VOLTAGE_LEVEL"] = pd.to_numeric(sp["VOLTAGE_LEVEL"], errors="coerce")
+        sp["HUB"] = sp["HUB"].astype(str).str.strip()
+        sp["HUB_BUS_NAME"] = sp["HUB_BUS_NAME"].astype(str).str.strip()
+        return sp
+    except Exception as e:
+        return None
+
+sp_df = load_settlement_points()
+
+# ─────────────────────────────────────────────
+#  FUZZY MATCHING HELPERS
+# ─────────────────────────────────────────────
+@st.cache_data
+def get_unique_substations():
+    """Return sorted list of unique substation names from ERCOT CSV."""
+    if sp_df is None:
+        return []
+    return sorted(sp_df["SUBSTATION"].dropna().unique().tolist())
+
+def clean_osm_name(name: str) -> str:
+    """Clean an OSM substation name for matching against ERCOT names."""
+    clean = name.upper().strip()
+    # Remove common suffixes that OSM includes but ERCOT doesn't
+    for suffix in [" SUBSTATION", " SWITCHING STATION", " SWITCHYARD",
+                   " SWITCH", " SUB", " SS", " STATION"]:
+        if clean.endswith(suffix):
+            clean = clean[: -len(suffix)].strip()
+    # Remove non-alphanumeric for comparison
+    return clean
+
+def fuzzy_match_substation(osm_name: str, top_n: int = 8):
+    """Return top N fuzzy matches from ERCOT substations for an OSM name."""
+    from thefuzz import fuzz, process
+    subs = get_unique_substations()
+    if not subs:
+        return []
+    cleaned = clean_osm_name(osm_name)
+    # Try multiple scorers and merge
+    results_ratio = process.extract(cleaned, subs, scorer=fuzz.ratio, limit=top_n)
+    results_partial = process.extract(cleaned, subs, scorer=fuzz.partial_ratio, limit=top_n)
+    results_sort = process.extract(cleaned, subs, scorer=fuzz.token_sort_ratio, limit=top_n)
+
+    # Combine and deduplicate, keeping best score
+    combined = {}
+    for result_set in [results_ratio, results_partial, results_sort]:
+        for item in result_set:
+            name, score = item[0], item[1]
+            if name not in combined or score > combined[name]:
+                combined[name] = score
+    # Sort by score descending
+    ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+    return ranked[:top_n]
+
+def get_buses_for_substation(substation_name: str) -> pd.DataFrame:
+    """Return all ERCOT buses at a given substation."""
+    if sp_df is None:
+        return pd.DataFrame()
+    mask = sp_df["SUBSTATION"] == substation_name.upper().strip()
+    return sp_df[mask][["ELECTRICAL_BUS", "NODE_NAME", "VOLTAGE_LEVEL",
+                        "SETTLEMENT_LOAD_ZONE", "HUB", "HUB_BUS_NAME",
+                        "PSSE_BUS_NAME"]].reset_index(drop=True)
+
 
 # ─────────────────────────────────────────────
 #  CSS
@@ -37,6 +116,11 @@ st.markdown("""
       font-size:12px; font-weight:600; color:#7880a8;
       text-transform:uppercase; letter-spacing:1px; margin:18px 0 10px 0;
   }
+  .match-badge {
+      display:inline-block; background:#2a2d45; border:1px solid #3a3d55;
+      border-radius:6px; padding:3px 10px; margin:2px 4px; font-size:12px; color:#ccc;
+  }
+  .match-score { color:#5de0a5; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -75,43 +159,25 @@ def nearest_kv_label(volts):
 
 # ─────────────────────────────────────────────
 #  ROLLING-AVERAGE BESS HELPER
-#
-#  Uses a 3-hr centred rolling average to find
-#  the smoothed low & high price hours, then
-#  sets charge/discharge windows of ±half_w hrs
-#  around those smoothed peaks.
-#  Returns: (net_revenue, roll_series,
-#            low_hr, high_hr,
-#            charge_window, discharge_window)
 # ─────────────────────────────────────────────
 def bess_calc(bdf: pd.DataFrame, half_w: int):
-    """
-    half_w = 1  →  2-hour storage  (±1 hr window)
-    half_w = 2  →  4-hour storage  (±2 hr window)
-    """
     roll = (bdf["LMP"]
             .rolling(window=3, center=True, min_periods=1)
             .mean()
             .reset_index(drop=True))
-
     low_idx  = roll.idxmin()
     high_idx = roll.idxmax()
     low_hr   = bdf.loc[low_idx,  "Hour"]
     high_hr  = bdf.loc[high_idx, "Hour"]
-
     hr_min = bdf["Hour"].min()
     hr_max = bdf["Hour"].max()
-
     charge_win    = (max(hr_min, low_hr  - half_w), min(hr_max, low_hr  + half_w))
     discharge_win = (max(hr_min, high_hr - half_w), min(hr_max, high_hr + half_w))
-
     ch_mask  = (bdf["Hour"] >= charge_win[0])    & (bdf["Hour"] <= charge_win[1])
     dis_mask = (bdf["Hour"] >= discharge_win[0]) & (bdf["Hour"] <= discharge_win[1])
-
     ch_avg  = bdf.loc[ch_mask,  "LMP"].mean() if ch_mask.any()  else 0
     dis_avg = bdf.loc[dis_mask, "LMP"].mean() if dis_mask.any() else 0
     revenue = round(dis_avg - ch_avg, 2)
-
     return revenue, roll, low_hr, high_hr, charge_win, discharge_win
 
 
@@ -166,6 +232,15 @@ with st.sidebar:
         df = st.session_state.lmp_df
     else:
         df = None
+
+    # Settlement points status
+    st.markdown("---")
+    st.markdown("### 🔌 Settlement Points")
+    if sp_df is not None:
+        st.success(f"✅ {sp_df['SUBSTATION'].nunique():,} substations · {len(sp_df):,} buses")
+    else:
+        st.error("❌ Settlement CSV not found")
+
     st.markdown("---")
     st.markdown("### 🔗 Other Tools")
     st.markdown(f'<a href="{SECOND_APP_URL}" target="_blank"><button style="width:100%;padding:8px;background:#1e2a3a;color:#4fc3f7;border:1px solid #2a3d55;border-radius:8px;cursor:pointer;font-size:13px;">📍 Open Fatal Flaw Analyser — SiteIQ</button></a>', unsafe_allow_html=True)
@@ -201,6 +276,7 @@ if page == "🏠  Home":
                 <b style="color:#5de0a5;">Current App</b><br><br>
                 🗺️ &nbsp;Hub & Node Analyser with OSM map<br>
                 📈 &nbsp;LMP Price Analysis & BESS strategy<br>
+                🔌 &nbsp;Substation → Bus mapping from ERCOT data<br>
                 📊 &nbsp;Top N buses, spread ranking, export<br>
                 🤖 &nbsp;AI Copilot powered by Claude
             </div>
@@ -238,7 +314,6 @@ if page == "🏠  Home":
     st.markdown("")
     st.markdown("---")
 
-    # Quick stats if data loaded
     if df is not None:
         st.markdown("### 📊 Loaded Dataset Overview")
         k1,k2,k3,k4 = st.columns(4)
@@ -272,7 +347,7 @@ if page == "🏠  Home":
 # ══════════════════════════════════════════════
 elif page == "🗺️  Node Analyser":
     st.title("🗺️  Hub & Node Analyser")
-    st.caption("Discovers transmission substations from OpenStreetMap. Hubs = 230 kV+ | Nodes = below 230 kV")
+    st.caption("Discovers transmission substations from OpenStreetMap, then matches them to ERCOT settlement points & buses.")
 
     st.markdown('<div class="section-header">Search Parameters</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([2,2,3])
@@ -286,7 +361,6 @@ elif page == "🗺️  Node Analyser":
         selected_kv_labels = st.multiselect("Filter Voltages", list(KV_MAP.keys()), default=list(KV_MAP.keys()))
         show_unknown_v     = st.checkbox("Include unknown voltage substations", value=True)
 
-    # Parse & validate
     lat, lon = None, None
     if lat_str.strip() and lon_str.strip():
         try:
@@ -392,6 +466,7 @@ out center tags;
         with k5: metric_card("Centre", f"{lat:.3f}, {lon:.3f}")
         st.markdown("")
 
+        # ── MAP ──
         fig_map = go.Figure()
         fig_map.add_trace(go.Scattermapbox(
             lat=[lat], lon=[lon], mode="markers+text",
@@ -436,6 +511,7 @@ out center tags;
         )
         st.plotly_chart(fig_map, use_container_width=True)
 
+        # ── Substation List ──
         st.markdown('<div class="section-header">Substation List</div>', unsafe_allow_html=True)
         def _style_type(val):
             if val=="Hub": return "background-color:#3b1f5e;color:#bf7fff;font-weight:600"
@@ -445,13 +521,150 @@ out center tags;
             use_container_width=True, height=300
         )
 
+        # ══════════════════════════════════════
+        #  🔌 SUBSTATION → ERCOT BUS MAPPING
+        # ══════════════════════════════════════
+        st.markdown("---")
+        st.markdown('<div class="section-header">🔌 Substation → ERCOT Bus Mapping</div>', unsafe_allow_html=True)
+        st.caption("Select an OSM substation, then pick the closest ERCOT match to see all buses at that substation.")
+
+        if sp_df is None:
+            st.error("Settlement Points CSV not loaded. Place `Settlement_Points_02202026_094122.csv` alongside the app.")
+            st.stop()
+
+        sel_osm = st.selectbox("Select an OSM Substation", sdf["Name"].tolist(), key="osm_sub_sel")
+
+        if sel_osm:
+            # Perform fuzzy matching
+            with st.spinner("Finding closest ERCOT matches …"):
+                matches = fuzzy_match_substation(sel_osm, top_n=8)
+
+            if matches:
+                # Build display labels with scores
+                match_options = [f"{name}  (score: {score})" for name, score in matches]
+                match_names   = [name for name, score in matches]
+
+                st.markdown(f"**OSM Name:** `{sel_osm}` → **Cleaned:** `{clean_osm_name(sel_osm)}`")
+
+                selected_match_label = st.selectbox(
+                    "Select the best ERCOT Substation match",
+                    match_options,
+                    key="ercot_match_sel"
+                )
+                # Extract the actual name from the label
+                selected_ercot_sub = selected_match_label.split("  (score:")[0].strip()
+
+                # Show buses at this substation
+                buses_at_sub = get_buses_for_substation(selected_ercot_sub)
+
+                if not buses_at_sub.empty:
+                    st.markdown(f"### 🔋 Buses at **{selected_ercot_sub}**")
+
+                    k1, k2, k3 = st.columns(3)
+                    with k1:
+                        metric_card("Total Buses", str(len(buses_at_sub)))
+                    with k2:
+                        zones = buses_at_sub["SETTLEMENT_LOAD_ZONE"].unique()
+                        metric_card("Load Zone(s)", ", ".join(zones))
+                    with k3:
+                        voltages = sorted(buses_at_sub["VOLTAGE_LEVEL"].dropna().unique())
+                        metric_card("Voltage Levels", ", ".join([f"{v:.0f}" if v == int(v) else f"{v}" for v in voltages]) + " kV")
+
+                    st.dataframe(buses_at_sub, use_container_width=True, height=250)
+
+                    # ── Direct LMP plotting if LMP data is loaded ──
+                    if df is not None:
+                        st.markdown("---")
+                        st.markdown('<div class="section-header">📈 LMP for Buses at This Substation</div>', unsafe_allow_html=True)
+
+                        # Find which buses from this substation exist in the LMP data
+                        lmp_buses = set(df["Bus"].unique())
+                        sub_buses = set(buses_at_sub["ELECTRICAL_BUS"].unique())
+                        matched_buses = sorted(lmp_buses & sub_buses)
+
+                        if matched_buses:
+                            st.success(f"✅ **{len(matched_buses)}** bus(es) from {selected_ercot_sub} found in your LMP data")
+
+                            sel_lmp_buses = st.multiselect(
+                                "Select buses to plot",
+                                matched_buses,
+                                default=matched_buses[:min(5, len(matched_buses))],
+                                key="sub_lmp_buses"
+                            )
+
+                            dates = sorted(df["Date"].unique().tolist())
+                            sel_date_node = st.selectbox("Select Date", dates, key="node_lmp_date") if len(dates) > 1 else dates[0]
+
+                            if sel_lmp_buses:
+                                PALETTE = ["#00d4ff","#ff8c42","#5de0a5","#bf7fff","#FFD700","#ff6b6b","#74c0fc","#f06292"]
+                                fig_node_lmp = go.Figure()
+                                node_summary = []
+
+                                for bi, bus_name in enumerate(sel_lmp_buses):
+                                    bdf = (df[(df["Bus"]==bus_name) & (df["Date"]==sel_date_node)]
+                                           .sort_values("Hour").reset_index(drop=True))
+                                    if bdf.empty:
+                                        continue
+
+                                    col = PALETTE[bi % len(PALETTE)]
+                                    fig_node_lmp.add_trace(go.Scatter(
+                                        x=bdf["Hour"], y=bdf["LMP"],
+                                        name=bus_name,
+                                        line=dict(color=col, width=2.5),
+                                        hovertemplate=f"Bus: {bus_name}<br>Hour %{{x}}<br>LMP: $%{{y:.2f}}<extra></extra>"
+                                    ))
+
+                                    # Calc BESS revenue
+                                    if len(bdf) >= 3:
+                                        r2, _, lh, hh, _, _ = bess_calc(bdf, 1)
+                                        r4, _, _, _, _, _   = bess_calc(bdf, 2)
+                                        sp = round(bdf["LMP"].max() - bdf["LMP"].min(), 2)
+                                        node_summary.append({
+                                            "Bus": bus_name,
+                                            "Min LMP": round(bdf["LMP"].min(), 2),
+                                            "Max LMP": round(bdf["LMP"].max(), 2),
+                                            "Spread": sp,
+                                            "2H Rev ($/MWh)": r2,
+                                            "4H Rev ($/MWh)": r4,
+                                        })
+
+                                fig_node_lmp.update_layout(
+                                    template="plotly_dark",
+                                    title=f"LMP at {selected_ercot_sub} Buses — {sel_date_node}",
+                                    xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1),
+                                    yaxis=dict(title="LMP ($/MWh)"),
+                                    legend=dict(orientation="h", y=1.10, x=0, bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
+                                    hovermode="x unified", height=480
+                                )
+                                st.plotly_chart(fig_node_lmp, use_container_width=True)
+
+                                if node_summary:
+                                    st.markdown("**BESS Revenue Summary (Rolling-Avg Strategy)**")
+                                    sum_df = pd.DataFrame(node_summary).sort_values("Spread", ascending=False)
+                                    st.dataframe(sum_df, use_container_width=True)
+
+                                    # Quick jump to full analysis
+                                    best = sum_df.iloc[0]["Bus"]
+                                    if st.button(f"📈 Open full analysis for **{best}**", key="jump_lmp_from_node"):
+                                        st.session_state.selected_bus = best
+                                        st.info(f"Switched to **{best}** — go to 📈 LMP Price Analysis.")
+                        else:
+                            st.warning(
+                                f"No buses from **{selected_ercot_sub}** were found in your LMP data. "
+                                f"The LMP CSV has buses like: {', '.join(list(lmp_buses)[:8])}…\n\n"
+                                f"The substation has buses like: {', '.join(list(sub_buses)[:8])}…"
+                            )
+                else:
+                    st.info(f"No buses found at substation **{selected_ercot_sub}** in the ERCOT CSV.")
+            else:
+                st.warning("No fuzzy matches found. The OSM name may not correspond to an ERCOT substation.")
+
         # ── Real-Time LMP from ERCOT public API ──
         st.markdown("---")
         st.markdown('<div class="section-header">⚡ Real-Time LMP for Selected Substation</div>', unsafe_allow_html=True)
 
         sel_sub = st.selectbox("Select Substation", sdf["Name"].tolist(), key="rtlmp_sub")
 
-        # Let user override/confirm the ERCOT settlement point name
         st.caption("ERCOT settlement point names may differ from OSM names. Edit below if needed.")
         sp_guess = sel_sub.upper().replace(" ","_").replace("-","_")[:20]
         settlement_point = st.text_input("ERCOT Settlement Point Name", value=sp_guess,
@@ -462,7 +675,6 @@ out center tags;
         if fetch_rt and settlement_point.strip():
             from datetime import datetime, timedelta, timezone
             now_utc   = datetime.now(timezone.utc)
-            # ERCOT SCED runs every 5 min; pull last 2 hours
             ts_from   = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
             ts_to     = now_utc.strftime("%Y-%m-%dT%H:%M:%S")
             sp_clean  = settlement_point.strip()
@@ -482,7 +694,6 @@ out center tags;
                     rt_resp.raise_for_status()
                     rt_json = rt_resp.json()
 
-                    # ERCOT API returns data under 'data' key as list of lists
                     fields  = [f["name"] for f in rt_json.get("fields", [])]
                     records = rt_json.get("data", [])
 
@@ -491,8 +702,6 @@ out center tags;
                                    "Check the settlement point name matches an ERCOT bus exactly (e.g. HB_NORTH, LZ_WEST).")
                     else:
                         rt_df = pd.DataFrame(records, columns=fields)
-
-                        # Normalise column names
                         rt_df.columns = [c.strip() for c in rt_df.columns]
                         ts_col  = next((c for c in rt_df.columns if "timestamp" in c.lower() or "time" in c.lower()), rt_df.columns[0])
                         lmp_col = next((c for c in rt_df.columns if "lmp" in c.lower() or "price" in c.lower()), rt_df.columns[-1])
@@ -507,12 +716,10 @@ out center tags;
                         max_lmp     = round(rt_df[lmp_col].max(), 2)
                         min_lmp     = round(rt_df[lmp_col].min(), 2)
 
-                        # Store for AI summary context
                         st.session_state["rt_summary"] = {
                             "sp": sp_clean, "latest": latest_lmp,
                             "avg": avg_lmp, "max": max_lmp, "min": min_lmp
                         }
-                        # Clear old AI summary so it regenerates with new LMP data
                         st.session_state["node_ai_summary"] = ""
 
                         k1,k2,k3,k4 = st.columns(4)
@@ -541,8 +748,7 @@ out center tags;
                             title=f"Real-Time LMP — {sp_clean}  (Last 2 Hours)",
                             xaxis_title="Time (UTC)",
                             yaxis_title="LMP ($/MWh)",
-                            height=380,
-                            margin=dict(t=50)
+                            height=380, margin=dict(t=50)
                         )
                         st.plotly_chart(fig_rt, use_container_width=True)
 
@@ -552,13 +758,13 @@ out center tags;
                                 use_container_width=True)
 
                 except requests.exceptions.HTTPError as e:
-                    st.error(f"ERCOT API returned an error: {rt_resp.status_code}. "
-                             "The settlement point name may not exist or the API is temporarily unavailable.")
+                    st.error(f"ERCOT API returned an error: {rt_resp.status_code}.")
                     with st.expander("Debug info"):
                         st.code(rt_resp.text[:500])
                 except Exception as e:
                     st.error(f"Could not fetch real-time data: {e}")
 
+        # ── Link to LMP Analysis ──
         st.markdown("---")
         if df is not None:
             st.markdown('<div class="section-header">Link Node to LMP Analysis</div>', unsafe_allow_html=True)
@@ -570,23 +776,20 @@ out center tags;
                 st.session_state.selected_bus = matched[0] if matched else bus_list[0]
                 st.info(f"Matched to bus: **{st.session_state.selected_bus}** — switch to 📈 LMP Price Analysis in the sidebar.")
 
-        # ── AI Workflow Summary ───────────────────
+        # ── AI Workflow Summary ──
         st.markdown("---")
         st.markdown('<div class="section-header">🤖 AI Node & LMP Summary</div>', unsafe_allow_html=True)
 
-        # Pull API key from sidebar session
         ai_key = st.session_state.get("api_key", "")
 
         if not ai_key:
             st.info("🔑 Enter your Anthropic API key in the sidebar to enable the AI summary.")
         else:
-            # Build a rich context from everything currently on screen
             nearest_5 = sdf.head(5)[["Name","Type","Voltage","Distance (mi)","Operator"]].to_string(index=False)
             hub_list   = sdf[sdf["Type"]=="Hub"][["Name","Voltage","Distance (mi)"]].head(5).to_string(index=False)
             node_list  = sdf[sdf["Type"]=="Node"][["Name","Voltage","Distance (mi)"]].head(5).to_string(index=False)
             volt_dist  = sdf["Voltage"].value_counts().to_string()
 
-            # Include RT LMP if it was fetched this session
             rt_lmp_context = ""
             if "rt_summary" in st.session_state and st.session_state.rt_summary:
                 rt_lmp_context = f"""
@@ -664,7 +867,6 @@ Be specific, use the actual numbers from the data, and keep each section to 2–
                     except Exception as e:
                         st.error(f"AI summary failed: {e}")
 
-            # Display persisted summary
             if "node_ai_summary" in st.session_state and st.session_state.node_ai_summary:
                 st.markdown("""
                 <div style="background:#0f1a14;border:1px solid #2a4a35;border-radius:12px;
@@ -691,7 +893,12 @@ elif page == "📈  LMP Price Analysis":
         st.info("👈  Upload an ERCOT LMP CSV from the sidebar to continue.")
         st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["🔍 Single Bus Analysis", "📊 Top N Buses by Spread", "📥 Export Revenue Table"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 Single Bus Analysis",
+        "🔌 Substation Lookup",
+        "📊 Top N Buses by Spread",
+        "📥 Export Revenue Table"
+    ])
 
     # ═══ TAB 1 – Single Bus ═══════════════════
     with tab1:
@@ -702,6 +909,29 @@ elif page == "📈  LMP Price Analysis":
 
         bus = st.selectbox("Search & select Bus name", bus_list, index=default_idx)
         st.session_state.selected_bus = bus
+
+        # ── Show substation info for selected bus ──
+        if sp_df is not None:
+            bus_info = sp_df[sp_df["ELECTRICAL_BUS"] == bus]
+            if not bus_info.empty:
+                row0 = bus_info.iloc[0]
+                st.markdown(
+                    f"**Substation:** `{row0['SUBSTATION']}` · "
+                    f"**Load Zone:** `{row0['SETTLEMENT_LOAD_ZONE']}` · "
+                    f"**Voltage:** `{row0['VOLTAGE_LEVEL']} kV` · "
+                    f"**Hub:** `{row0['HUB'] if row0['HUB'] not in ['nan',''] else '—'}`"
+                )
+                # Show sibling buses at same substation
+                siblings = sp_df[sp_df["SUBSTATION"] == row0["SUBSTATION"]]["ELECTRICAL_BUS"].unique()
+                siblings_in_lmp = sorted(set(siblings) & set(bus_list))
+                if len(siblings_in_lmp) > 1:
+                    with st.expander(f"🔗 {len(siblings_in_lmp)} sibling buses at {row0['SUBSTATION']} (in LMP data)"):
+                        sib_cols = st.columns(min(6, len(siblings_in_lmp)))
+                        for si, sib_bus in enumerate(siblings_in_lmp[:12]):
+                            with sib_cols[si % len(sib_cols)]:
+                                if st.button(sib_bus, key=f"sib_{sib_bus}"):
+                                    st.session_state.selected_bus = sib_bus
+                                    st.rerun()
 
         dates = sorted(df["Date"].unique().tolist())
         multi_date = st.checkbox("📅 Compare multiple dates on one chart", value=False)
@@ -729,8 +959,6 @@ elif page == "📈  LMP Price Analysis":
                 continue
 
             col = PALETTE[di % len(PALETTE)]
-
-            # ── Rolling average & BESS calc ──────
             rev2, roll2, low2, high2, cw2, dw2 = bess_calc(bdf, half_w=1)
             rev4, roll4, low4, high4, cw4, dw4 = bess_calc(bdf, half_w=2)
 
@@ -747,7 +975,6 @@ elif page == "📈  LMP Price Analysis":
                 "4H Revenue ($/MWh)": rev4,
             })
 
-            # Raw LMP line
             fig.add_trace(go.Scatter(
                 x=bdf["Hour"], y=bdf["LMP"],
                 name=f"LMP {date}",
@@ -755,10 +982,7 @@ elif page == "📈  LMP Price Analysis":
                 hovertemplate=f"Date: {date}<br>Hour %{{x}}<br>LMP: $%{{y:.2f}}<extra></extra>"
             ))
 
-            # BESS overlays — single-date mode only
             if not multi_date:
-
-                # ── Rolling average lines ────────
                 if show_2hr:
                     fig.add_trace(go.Scatter(
                         x=bdf["Hour"], y=roll2,
@@ -766,7 +990,7 @@ elif page == "📈  LMP Price Analysis":
                         line=dict(color="#00e676", width=1.5, dash="dot"),
                         hovertemplate="Hour %{x}<br>3-hr Avg: $%{y:.2f}<extra></extra>"
                     ))
-                if show_4hr and not show_2hr:   # avoid duplicate roll line if both on
+                if show_4hr and not show_2hr:
                     fig.add_trace(go.Scatter(
                         x=bdf["Hour"], y=roll4,
                         name="3-hr Roll Avg (4H basis)",
@@ -774,7 +998,6 @@ elif page == "📈  LMP Price Analysis":
                         hovertemplate="Hour %{x}<br>3-hr Avg: $%{y:.2f}<extra></extra>"
                     ))
 
-                # ── 2H shaded windows & band ─────
                 if show_2hr:
                     fig.add_vrect(x0=cw2[0], x1=cw2[1],
                                   fillcolor="#00e676", opacity=0.10, line_width=0,
@@ -794,7 +1017,6 @@ elif page == "📈  LMP Price Analysis":
                         hovertemplate="Hour %{x}<br>2H Band: $%{y:.2f}<extra></extra>"
                     ))
 
-                # ── 4H shaded windows & band ─────
                 if show_4hr:
                     fig.add_vrect(x0=cw4[0], x1=cw4[1],
                                   fillcolor="#00bcd4", opacity=0.07, line_width=0,
@@ -814,7 +1036,6 @@ elif page == "📈  LMP Price Analysis":
                         hovertemplate="Hour %{x}<br>4H Band: $%{y:.2f}<extra></extra>"
                     ))
 
-                # ── Markers at rolling-avg peaks ─
                 if show_2hr:
                     fig.add_trace(go.Scatter(
                         x=[low2], y=[bdf.loc[bdf["Hour"]==low2, "LMP"].values[0]],
@@ -850,7 +1071,6 @@ elif page == "📈  LMP Price Analysis":
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # ── Legend explainer ────────────────────
         with st.expander("ℹ️  How the rolling-average BESS strategy works"):
             st.markdown("""
 **Step 1 — Smooth the price curve**
@@ -871,7 +1091,6 @@ This removes single-hour price spikes that would be impractical to capture.
 **Revenue** = average LMP during discharge window − average LMP during charge window
             """)
 
-        # KPIs
         if summary_rows:
             sr = summary_rows[0]
             k1,k2,k3,k4,k5 = st.columns(5)
@@ -891,8 +1110,127 @@ This removes single-hour price spikes that would be impractical to capture.
             st.markdown('<div class="section-header">Multi-Date Summary</div>', unsafe_allow_html=True)
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
-    # ═══ TAB 2 – Top N Buses ══════════════════
+    # ═══ TAB 2 – Substation Lookup ════════════
     with tab2:
+        st.markdown('<div class="section-header">🔌 Find Buses by ERCOT Substation</div>', unsafe_allow_html=True)
+        st.caption("Search for an ERCOT substation name to see all its buses and their LMP data.")
+
+        if sp_df is None:
+            st.error("Settlement Points CSV not loaded.")
+            st.stop()
+
+        all_subs = get_unique_substations()
+
+        search_mode = st.radio("Search mode", ["Browse substations", "Fuzzy search by name"], horizontal=True, key="sub_search_mode")
+
+        if search_mode == "Browse substations":
+            # Filter by load zone
+            zone_filter = st.selectbox("Filter by Load Zone", ["All"] + sorted(sp_df["SETTLEMENT_LOAD_ZONE"].unique().tolist()), key="zone_filt")
+            if zone_filter != "All":
+                filtered_subs = sorted(sp_df[sp_df["SETTLEMENT_LOAD_ZONE"] == zone_filter]["SUBSTATION"].unique().tolist())
+            else:
+                filtered_subs = all_subs
+
+            chosen_sub = st.selectbox(f"Select Substation ({len(filtered_subs)} available)", filtered_subs, key="browse_sub")
+        else:
+            fuzzy_input = st.text_input("Type a substation name to search", key="fuzzy_sub_input")
+            if fuzzy_input.strip():
+                matches = fuzzy_match_substation(fuzzy_input, top_n=10)
+                match_labels = [f"{n}  (score: {s})" for n, s in matches]
+                chosen_label = st.selectbox("Best matches", match_labels, key="fuzzy_sub_result")
+                chosen_sub = chosen_label.split("  (score:")[0].strip()
+            else:
+                chosen_sub = None
+
+        if chosen_sub:
+            buses_here = get_buses_for_substation(chosen_sub)
+
+            if not buses_here.empty:
+                k1, k2, k3 = st.columns(3)
+                with k1:
+                    metric_card("Substation", chosen_sub)
+                with k2:
+                    metric_card("Total Buses", str(len(buses_here)))
+                with k3:
+                    zones = buses_here["SETTLEMENT_LOAD_ZONE"].unique()
+                    metric_card("Load Zone", ", ".join(zones))
+
+                st.dataframe(buses_here, use_container_width=True, height=250)
+
+                # Find which of these buses are in the LMP data
+                lmp_buses = set(df["Bus"].unique())
+                sub_buses = set(buses_here["ELECTRICAL_BUS"].unique())
+                matched_lmp = sorted(lmp_buses & sub_buses)
+
+                if matched_lmp:
+                    st.success(f"✅ **{len(matched_lmp)}** bus(es) found in your LMP data")
+
+                    sel_plot_buses = st.multiselect(
+                        "Select buses to plot",
+                        matched_lmp,
+                        default=matched_lmp[:min(5, len(matched_lmp))],
+                        key="tab2_plot_buses"
+                    )
+
+                    dates = sorted(df["Date"].unique().tolist())
+                    sel_date_t2 = st.selectbox("Date", dates, key="tab2_date") if len(dates) > 1 else dates[0]
+
+                    if sel_plot_buses:
+                        PALETTE = ["#00d4ff","#ff8c42","#5de0a5","#bf7fff","#FFD700","#ff6b6b","#74c0fc","#f06292"]
+                        fig_t2 = go.Figure()
+                        rev_rows_t2 = []
+
+                        for bi, bname in enumerate(sel_plot_buses):
+                            bdf = (df[(df["Bus"]==bname) & (df["Date"]==sel_date_t2)]
+                                   .sort_values("Hour").reset_index(drop=True))
+                            if bdf.empty:
+                                continue
+                            c = PALETTE[bi % len(PALETTE)]
+                            fig_t2.add_trace(go.Scatter(
+                                x=bdf["Hour"], y=bdf["LMP"],
+                                name=bname,
+                                line=dict(color=c, width=2.5),
+                                hovertemplate=f"Bus: {bname}<br>Hour %{{x}}<br>LMP: $%{{y:.2f}}<extra></extra>"
+                            ))
+                            if len(bdf) >= 3:
+                                r2, _, _, _, _, _ = bess_calc(bdf, 1)
+                                r4, _, _, _, _, _ = bess_calc(bdf, 2)
+                                sp_val = round(bdf["LMP"].max() - bdf["LMP"].min(), 2)
+                                rev_rows_t2.append({
+                                    "Bus": bname, "Spread": sp_val,
+                                    "2H Rev": r2, "4H Rev": r4,
+                                    "Avg LMP": round(bdf["LMP"].mean(), 2),
+                                })
+
+                        fig_t2.update_layout(
+                            template="plotly_dark",
+                            title=f"LMP at {chosen_sub} — {sel_date_t2}",
+                            xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1),
+                            yaxis=dict(title="LMP ($/MWh)"),
+                            legend=dict(orientation="h", y=1.10, x=0, bgcolor="rgba(0,0,0,0)"),
+                            hovermode="x unified", height=480,
+                        )
+                        st.plotly_chart(fig_t2, use_container_width=True)
+
+                        if rev_rows_t2:
+                            st.markdown("**BESS Revenue (Rolling-Avg Strategy)**")
+                            rev_df_t2 = pd.DataFrame(rev_rows_t2).sort_values("Spread", ascending=False)
+                            st.dataframe(rev_df_t2, use_container_width=True)
+
+                            best_b = rev_df_t2.iloc[0]["Bus"]
+                            if st.button(f"📈 Full BESS analysis for **{best_b}**", key="jump_from_tab2"):
+                                st.session_state.selected_bus = best_b
+                                st.info(f"Switched to **{best_b}** — click the 'Single Bus Analysis' tab.")
+                else:
+                    st.warning(
+                        f"None of the {len(sub_buses)} buses at **{chosen_sub}** appear in your uploaded LMP data. "
+                        f"Buses at this substation: {', '.join(list(sub_buses)[:10])}…"
+                    )
+            else:
+                st.info(f"No data found for substation **{chosen_sub}**.")
+
+    # ═══ TAB 3 – Top N Buses ══════════════════
+    with tab3:
         st.markdown('<div class="section-header">Top N Buses by LMP Spread</div>', unsafe_allow_html=True)
         dates_all = sorted(df["Date"].unique().tolist())
         c1, c2 = st.columns(2)
@@ -917,6 +1255,13 @@ This removes single-hour price spikes that would be impractical to capture.
             rev_rows.append({"Bus":row["Bus"],"2H Rev":r2,"4H Rev":r4,
                              "Low Hr":lh2,"High Hr":hh2})
         top_df = bus_stats.merge(pd.DataFrame(rev_rows), on="Bus")
+
+        # Enrich with substation info
+        if sp_df is not None:
+            sub_lookup = sp_df.drop_duplicates("ELECTRICAL_BUS")[["ELECTRICAL_BUS","SUBSTATION","SETTLEMENT_LOAD_ZONE"]]
+            top_df = top_df.merge(sub_lookup, left_on="Bus", right_on="ELECTRICAL_BUS", how="left").drop(columns=["ELECTRICAL_BUS"], errors="ignore")
+            top_df["SUBSTATION"] = top_df["SUBSTATION"].fillna("—")
+            top_df["SETTLEMENT_LOAD_ZONE"] = top_df["SETTLEMENT_LOAD_ZONE"].fillna("—")
 
         fig_top = px.bar(
             top_df, x="Bus", y="Spread", color="Spread",
@@ -951,8 +1296,8 @@ This removes single-hour price spikes that would be impractical to capture.
                 st.session_state.selected_bus = best_bus
                 st.info(f"Switched to **{best_bus}** — click the 'Single Bus Analysis' tab.")
 
-    # ═══ TAB 3 – Export ═══════════════════════
-    with tab3:
+    # ═══ TAB 4 – Export ═══════════════════════
+    with tab4:
         st.markdown('<div class="section-header">Export BESS Revenue for All Buses</div>', unsafe_allow_html=True)
         dates_exp = sorted(df["Date"].unique().tolist())
         exp_date  = st.selectbox("Select Date for Export", dates_exp, key="exp_date") if len(dates_exp)>1 else dates_exp[0]
@@ -970,7 +1315,8 @@ This removes single-hour price spikes that would be impractical to capture.
                     sp = round(bdf_e["LMP"].max() - bdf_e["LMP"].min(), 2)
                     rec = ("Merchant Arbitrage" if sp>80
                            else ("Solar + Storage Overbuild" if sp>40 else "Ancillary / Capacity"))
-                    exp_rows.append({
+
+                    row_data = {
                         "Date": exp_date, "Bus": bus_name,
                         "Min LMP": round(bdf_e["LMP"].min(),2),
                         "Max LMP": round(bdf_e["LMP"].max(),2),
@@ -983,7 +1329,19 @@ This removes single-hour price spikes that would be impractical to capture.
                         "2H Revenue ($/MWh)": r2,
                         "4H Revenue ($/MWh)": r4,
                         "Recommended Strategy": rec,
-                    })
+                    }
+
+                    # Add substation info
+                    if sp_df is not None:
+                        bus_sp = sp_df[sp_df["ELECTRICAL_BUS"] == bus_name]
+                        if not bus_sp.empty:
+                            row_data["Substation"] = bus_sp.iloc[0]["SUBSTATION"]
+                            row_data["Load Zone"]  = bus_sp.iloc[0]["SETTLEMENT_LOAD_ZONE"]
+                        else:
+                            row_data["Substation"] = "—"
+                            row_data["Load Zone"]  = "—"
+
+                    exp_rows.append(row_data)
 
             exp_df = (pd.DataFrame(exp_rows)
                       .sort_values("Spread ($/MWh)", ascending=False)
@@ -1026,7 +1384,6 @@ elif page == "🤖  AI Copilot":
         st.info("👈  Upload an ERCOT LMP CSV from the sidebar first.")
         st.stop()
 
-    # Build data context
     dates_ai   = sorted(df["Date"].unique().tolist())
     bus_list_ai = sorted(df["Bus"].unique().tolist())
     top_buses_ai = (
@@ -1035,6 +1392,19 @@ elif page == "🤖  AI Copilot":
         .sort_values("spread", ascending=False)
         .head(10).round(2).reset_index()
     )
+
+    # Enrich AI context with substation info for top buses
+    sub_context = ""
+    if sp_df is not None:
+        sub_lookup = sp_df.drop_duplicates("ELECTRICAL_BUS")[["ELECTRICAL_BUS","SUBSTATION","SETTLEMENT_LOAD_ZONE"]]
+        top_enriched = top_buses_ai.merge(sub_lookup, left_on="Bus", right_on="ELECTRICAL_BUS", how="left")
+        sub_context = f"""
+Substation mapping for top buses:
+{top_enriched[['Bus','SUBSTATION','SETTLEMENT_LOAD_ZONE','spread']].to_string(index=False)}
+
+Settlement Points database: {sp_df['SUBSTATION'].nunique()} unique substations, {len(sp_df)} total bus entries across 4 load zones.
+"""
+
     data_context = f"""
 You are an expert ERCOT energy market analyst and BESS (Battery Energy Storage System) strategy advisor.
 
@@ -1048,6 +1418,7 @@ The user has uploaded an ERCOT LMP dataset:
 
 Top 10 buses by LMP Spread:
 {top_buses_ai.to_string(index=False)}
+{sub_context}
 
 BESS Strategy used in this dashboard:
 - A 3-hour centred rolling average smooths the price curve before finding optimal charge/discharge hours.
@@ -1061,6 +1432,7 @@ Strategy thresholds:
 - Spread < $40/MWh  → Capacity / Ancillary Market Focus
 
 Answer concisely and specifically using numbers from the dataset. Focus on actionable BESS development insights.
+When the user asks about a bus, also mention which substation it belongs to and its load zone if available.
 """
 
     st.markdown('<div class="section-header">Suggested Questions</div>', unsafe_allow_html=True)
@@ -1068,7 +1440,7 @@ Answer concisely and specifically using numbers from the dataset. Focus on actio
         "Which buses have the best arbitrage opportunity?",
         "What is the recommended BESS strategy for the top bus?",
         "Summarise the overall LMP price trends in this dataset",
-        "Which hours have the highest and lowest average prices?",
+        "Which substations have the most buses with high spreads?",
         "Compare 2H vs 4H storage economics for the top nodes",
         "What does the spread distribution suggest about market volatility?",
     ]
