@@ -11,7 +11,7 @@ import os
 # ─────────────────────────────────────────────
 #  PAGE CONFIG
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="ERCOT BESS Dashboard", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Sunstripe | ERCOT LMP & BESS Intelligence", page_icon="⚡", layout="wide")
 
 # ─────────────────────────────────────────────
 #  SESSION STATE
@@ -149,22 +149,31 @@ def get_buses_for_substation(substation_name: str) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-  .card {
-      background:#1a1d2e; border:1px solid #2a2d45;
-      border-radius:12px; padding:16px 20px; margin-bottom:4px;
-  }
-  .card-title { color:#7880a8; font-size:11px; text-transform:uppercase; letter-spacing:1px; }
-  .card-value { color:#ffffff; font-size:22px; font-weight:700; margin-top:4px; }
-  .card-sub   { color:#5de0a5; font-size:11px; margin-top:3px; }
-  .section-header {
-      font-size:12px; font-weight:600; color:#7880a8;
-      text-transform:uppercase; letter-spacing:1px; margin:18px 0 10px 0;
-  }
-  .match-badge {
-      display:inline-block; background:#2a2d45; border:1px solid #3a3d55;
-      border-radius:6px; padding:3px 10px; margin:2px 4px; font-size:12px; color:#ccc;
-  }
-  .match-score { color:#5de0a5; font-weight:700; }
+  :root { --ss-red: #c92532; --ss-ink: #171717; --ss-muted: #666666; --ss-line: #dededb; --ss-paper: #f7f7f4; }
+  [data-testid="stAppViewContainer"] { background: var(--ss-paper); color: var(--ss-ink); }
+  [data-testid="stHeader"] { background: rgba(247,247,244,0.92); }
+  [data-testid="stSidebar"] { background: #171717; border-right: 3px solid var(--ss-red); }
+  [data-testid="stSidebar"] * { color: #f4f4f1 !important; }
+  [data-testid="stSidebar"] [data-baseweb="radio"] label { color: #f4f4f1 !important; }
+  h1, h2, h3 { color: var(--ss-ink) !important; letter-spacing: -0.025em; }
+  h1 { font-weight: 750 !important; }
+  p, li, label, [data-testid="stMarkdownContainer"] { color: var(--ss-ink); }
+  a { color: var(--ss-red) !important; }
+  .card { background:#ffffff; border:1px solid var(--ss-line); border-left:4px solid var(--ss-red); border-radius:8px; padding:15px 18px; margin-bottom:4px; box-shadow:0 2px 8px rgba(0,0,0,0.025); }
+  .card-title { color:#666666; font-size:10px; text-transform:uppercase; letter-spacing:1.1px; font-weight:700; }
+  .card-value { color:#171717; font-size:22px; font-weight:750; margin-top:5px; overflow-wrap:anywhere; }
+  .card-sub { color:var(--ss-red); font-size:11px; margin-top:4px; }
+  .section-header { font-size:11px; font-weight:750; color:var(--ss-red); text-transform:uppercase; letter-spacing:1.2px; margin:18px 0 10px 0; }
+  .match-badge { display:inline-block; background:#f1f1ee; border:1px solid #dededb; border-radius:5px; padding:3px 10px; margin:2px 4px; font-size:12px; color:#333333; }
+  .match-score { color:var(--ss-red); font-weight:750; }
+  div[data-testid="stMetric"] { background:#ffffff; border:1px solid var(--ss-line); border-top:3px solid var(--ss-red); padding:12px 14px; border-radius:8px; }
+  div[data-testid="stMetricLabel"] p { color:#666666 !important; font-size:11px !important; text-transform:uppercase; letter-spacing:.7px; }
+  div[data-testid="stMetricValue"] { color:#171717 !important; }
+  .stButton > button { border-radius:6px; border:1px solid #171717; background:#171717; color:#ffffff; font-weight:650; }
+  .stButton > button:hover { border-color:var(--ss-red); background:var(--ss-red); color:#ffffff; }
+  div[data-testid="stFileUploader"] { background:rgba(255,255,255,.04); border-radius:8px; }
+  [data-testid="stDataFrame"] { border:1px solid var(--ss-line); border-radius:8px; }
+  hr { border-color:#dededb !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -202,9 +211,13 @@ def nearest_kv_label(volts):
     return best if best_diff < 0.20 else f"{volts/1000:.1f} kV"
 
 # ─────────────────────────────────────────────
-#  ROLLING-AVERAGE BESS HELPER
+#  LEGACY QUICK SPREAD PROXY (NOT DISPATCH OPTIMISATION)
 # ─────────────────────────────────────────────
 def bess_calc(bdf: pd.DataFrame, half_w: int):
+    """Return a rolling-average spread proxy for legacy ranking/export views only.
+
+    Use the BESS Duration Assessment tab for the optimisation-based 2H/4H comparison.
+    """
     roll = (bdf["LMP"]
             .rolling(window=3, center=True, min_periods=1)
             .mean()
@@ -235,14 +248,31 @@ def load_lmp(f):
         "HourEnding":"Hour","HOURENDING":"Hour","Hour Ending":"Hour",
         "HOUR_ENDING":"Hour","HE":"Hour",
         "BusName":"Bus","BUSNAME":"Bus","Bus Name":"Bus",
-        "SETTLEMENT_POINT":"Bus","Settlement Point":"Bus","Node":"Bus",
-        "LMP":"LMP","SETTLEMENT_POINT_PRICE":"LMP","Price":"LMP",
+        "SETTLEMENT_POINT":"Bus","Settlement Point":"Bus","SettlementPoint":"Bus",
+        "SETTLEMENTPOINT":"Bus","settlementPoint":"Bus","Node":"Bus",
+        "LMP":"LMP","SETTLEMENT_POINT_PRICE":"LMP","SettlementPointPrice":"LMP","Price":"LMP",
         "DSTFlag":"DST","DSTFLAG":"DST","DST Flag":"DST","DST_FLAG":"DST",
     }
+    # Detect SCED / timestamp-style inputs before the canonical columns are added.
+    def _normalise_col_name(name):
+        return "".join(ch for ch in str(name).lower() if ch.isalnum())
+    timestamp_col = next((c for c in raw.columns if _normalise_col_name(c) in {
+        "scedtimestamp", "timestamp", "timestamputc", "datetime", "intervaltimestamp",
+        "settlementtimestamp", "intervalendingtimestamp"
+    }), None)
     raw = raw.rename(columns={c: rename_rules[c] for c in raw.columns if c in rename_rules})
     for col in ["Date","Hour","Bus","LMP"]:
         if col not in raw.columns:
             raw[col] = None
+    if timestamp_col is not None and timestamp_col in raw.columns:
+        parsed_ts = pd.to_datetime(raw[timestamp_col], errors="coerce")
+        # Naive ERCOT timestamps are treated as ERCOT local wall time. Each timestamp is
+        # mapped to its hour-beginning bucket; the optimiser averages sub-hourly records.
+        if parsed_ts.notna().any():
+            if raw["Date"].isna().all() or raw["Date"].astype(str).str.strip().isin(["", "None", "nan"]).all():
+                raw["Date"] = parsed_ts.dt.strftime("%Y-%m-%d")
+            if raw["Hour"].isna().all() or raw["Hour"].astype(str).str.strip().isin(["", "None", "nan"]).all():
+                raw["Hour"] = parsed_ts.dt.hour + 1
     if raw["Hour"].dtype == object:
         raw["Hour"] = (raw["Hour"].astype(str).str.strip()
                        .str.extract(r"(\d+)")[0].astype(float))
@@ -254,10 +284,228 @@ def load_lmp(f):
 
 
 # ─────────────────────────────────────────────
+#  DURATION-AWARE BESS PRICE-TAKER BACKTEST
+# ─────────────────────────────────────────────
+def _prepare_hourly_dispatch_day(day_df: pd.DataFrame):
+    """Aggregate duplicate records to one LMP per hour and retain missing hours as unavailable."""
+    if day_df is None or day_df.empty or "Hour" not in day_df or "LMP" not in day_df:
+        return None
+    tmp = day_df[["Hour", "LMP"]].copy()
+    tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
+    tmp["LMP"] = pd.to_numeric(tmp["LMP"], errors="coerce")
+    tmp = tmp.dropna(subset=["Hour"])
+    if tmp.empty:
+        return None
+    tmp["Hour"] = tmp["Hour"].round().astype(int)
+    hourly = tmp.groupby("Hour", as_index=True)["LMP"].mean().sort_index()
+    min_h, max_h = int(hourly.index.min()), int(hourly.index.max())
+    if min_h >= 1 and max_h <= 24:
+        grid = list(range(1, 25))  # ERCOT Hour Ending 1–24
+    elif min_h >= 0 and max_h <= 23:
+        grid = list(range(0, 24))  # hour-beginning 0–23
+    else:
+        grid = sorted(hourly.index.unique().tolist())
+    result = pd.DataFrame({"Hour": grid})
+    result["LMP"] = result["Hour"].map(hourly)
+    # A full day needs enough price points to make a 2h/4h duration comparison meaningful.
+    if result["LMP"].notna().sum() < max(12, int(0.70 * len(result))):
+        return None
+    return result.reset_index(drop=True)
+
+
+def _optimise_one_day(day_df: pd.DataFrame, duration_hours: int,
+                      round_trip_efficiency: float = 0.88,
+                      max_efc_per_day: float = 1.0,
+                      degradation_cost_per_mwh: float = 0.0):
+    """Maximise hourly arbitrage margin with charge/discharge, SOC, cycling and mode constraints.
+
+    The model is normalised to 1 MW AC. Results therefore scale linearly to a larger plant
+    under the price-taker assumption. SOC is cyclic over each day (start SOC = end SOC).
+    """
+    try:
+        from scipy.optimize import milp, Bounds, LinearConstraint
+        from scipy.sparse import lil_matrix
+    except Exception as exc:
+        raise RuntimeError("SciPy is required for the dispatch optimiser. Install requirements.txt (scipy>=1.11).") from exc
+
+    hourly = _prepare_hourly_dispatch_day(day_df)
+    if hourly is None:
+        return None
+    prices = hourly["LMP"].to_numpy(dtype=float)
+    valid = np.isfinite(prices)
+    prices_objective = np.where(valid, prices, 0.0)
+    n = len(prices)
+    if n < 12:
+        return None
+
+    p_mw = 1.0
+    e_mwh = p_mw * float(duration_hours)
+    eta_c = math.sqrt(float(round_trip_efficiency))
+    eta_d = math.sqrt(float(round_trip_efficiency))
+    dt = 1.0
+
+    # x = [charge(n), discharge(n), SOC(n+1), charge-mode binary(n)]
+    c0 = 0
+    d0 = n
+    s0 = 2 * n
+    z0 = 3 * n + 1
+    nvars = 4 * n + 1
+    obj = np.zeros(nvars, dtype=float)
+    obj[c0:c0+n] = prices_objective * dt
+    obj[d0:d0+n] = -(prices_objective - float(degradation_cost_per_mwh)) * dt
+
+    lower = np.zeros(nvars, dtype=float)
+    upper = np.full(nvars, np.inf, dtype=float)
+    upper[c0:c0+n] = np.where(valid, p_mw, 0.0)
+    upper[d0:d0+n] = np.where(valid, p_mw, 0.0)
+    upper[s0:s0+n+1] = e_mwh
+    upper[z0:z0+n] = 1.0
+    integrality = np.zeros(nvars, dtype=int)
+    integrality[z0:z0+n] = 1
+
+    # n state transitions + 1 cyclic SOC + 2n charge/discharge mode rows + 1 cycle cap
+    nrows = 3 * n + 2
+    A = lil_matrix((nrows, nvars), dtype=float)
+    lo = np.full(nrows, -np.inf, dtype=float)
+    hi = np.full(nrows, np.inf, dtype=float)
+    row = 0
+    for t in range(n):
+        A[row, s0+t] = -1.0
+        A[row, s0+t+1] = 1.0
+        A[row, c0+t] = -eta_c * dt
+        A[row, d0+t] = (1.0 / eta_d) * dt
+        lo[row] = hi[row] = 0.0
+        row += 1
+
+    A[row, s0] = 1.0
+    A[row, s0+n] = -1.0
+    lo[row] = hi[row] = 0.0
+    row += 1
+
+    for t in range(n):
+        # If z=1, charging is allowed and discharge is forced to zero.
+        A[row, c0+t] = 1.0
+        A[row, z0+t] = -p_mw
+        hi[row] = 0.0
+        row += 1
+    for t in range(n):
+        A[row, d0+t] = 1.0
+        A[row, z0+t] = p_mw
+        hi[row] = p_mw
+        row += 1
+
+    # Limit discharge throughput to a user-set number of equivalent full cycles per day.
+    for t in range(n):
+        A[row, d0+t] = dt
+    hi[row] = e_mwh * float(max_efc_per_day)
+
+    result = milp(
+        c=obj,
+        integrality=integrality,
+        bounds=Bounds(lower, upper),
+        constraints=LinearConstraint(A.tocsr(), lo, hi),
+        options={"time_limit": 8.0, "mip_rel_gap": 0.005},
+    )
+    if result.x is None:
+        return None
+    x = result.x
+    charge = np.clip(x[c0:c0+n], 0.0, p_mw)
+    discharge = np.clip(x[d0:d0+n], 0.0, p_mw)
+    soc = np.clip(x[s0+1:s0+n+1], 0.0, e_mwh)
+    real_prices = np.where(valid, prices, np.nan)
+    charged_mwh = float(np.nansum(charge * dt))
+    discharged_mwh = float(np.nansum(discharge * dt))
+    charge_cost = float(np.nansum(np.where(valid, charge * prices, 0.0) * dt))
+    discharge_revenue = float(np.nansum(np.where(valid, discharge * prices, 0.0) * dt))
+    gross_margin = discharge_revenue - charge_cost
+    degradation_cost = discharged_mwh * float(degradation_cost_per_mwh)
+    net_margin = gross_margin - degradation_cost
+
+    ch_denom = float(np.sum(charge * dt))
+    dis_denom = float(np.sum(discharge * dt))
+    avg_charge = (float(np.nansum(charge * real_prices * dt) / ch_denom)
+                  if ch_denom > 1e-8 else np.nan)
+    avg_discharge = (float(np.nansum(discharge * real_prices * dt) / dis_denom)
+                     if dis_denom > 1e-8 else np.nan)
+
+    dispatch = hourly.copy()
+    dispatch["Charge_MW"] = charge
+    dispatch["Discharge_MW"] = discharge
+    dispatch["SOC_MWh"] = soc
+    dispatch["Duration_Hours"] = int(duration_hours)
+    dispatch["EFC"] = discharged_mwh / e_mwh if e_mwh else 0.0
+    return {
+        "duration": int(duration_hours),
+        "gross_margin_per_mw_day": gross_margin,
+        "net_margin_per_mw_day": net_margin,
+        "discharge_revenue_per_mw_day": discharge_revenue,
+        "charge_cost_per_mw_day": charge_cost,
+        "degradation_cost_per_mw_day": degradation_cost,
+        "charged_mwh_per_mw": charged_mwh,
+        "discharged_mwh_per_mw": discharged_mwh,
+        "efc": discharged_mwh / e_mwh if e_mwh else 0.0,
+        "avg_charge_price": avg_charge,
+        "avg_discharge_price": avg_discharge,
+        "dispatch": dispatch,
+        "solver_success": bool(result.success),
+        "solver_message": str(result.message),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def calculate_duration_assessment(selected_df: pd.DataFrame,
+                                  round_trip_efficiency: float,
+                                  max_efc_per_day: float,
+                                  degradation_cost_per_mwh: float):
+    """Backtest 2h and 4h systems day by day for the selected node and dates."""
+    daily_rows = []
+    dispatch_frames = []
+    skipped_days = 0
+    if selected_df is None or selected_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), 0
+
+    for analysis_date, day in selected_df.groupby("_analysis_date", dropna=True):
+        d2 = _optimise_one_day(day, 2, round_trip_efficiency, max_efc_per_day, degradation_cost_per_mwh)
+        d4 = _optimise_one_day(day, 4, round_trip_efficiency, max_efc_per_day, degradation_cost_per_mwh)
+        if d2 is None or d4 is None:
+            skipped_days += 1
+            continue
+        date_label = pd.Timestamp(analysis_date).strftime("%Y-%m-%d")
+        daily_rows.append({
+            "Date": date_label,
+            "2H Gross Margin ($/MW-day)": d2["gross_margin_per_mw_day"],
+            "4H Gross Margin ($/MW-day)": d4["gross_margin_per_mw_day"],
+            "2H Net Margin ($/MW-day)": d2["net_margin_per_mw_day"],
+            "4H Net Margin ($/MW-day)": d4["net_margin_per_mw_day"],
+            "2H Charge Price ($/MWh)": d2["avg_charge_price"],
+            "2H Discharge Price ($/MWh)": d2["avg_discharge_price"],
+            "4H Charge Price ($/MWh)": d4["avg_charge_price"],
+            "4H Discharge Price ($/MWh)": d4["avg_discharge_price"],
+            "2H Discharged MWh/MW-day": d2["discharged_mwh_per_mw"],
+            "4H Discharged MWh/MW-day": d4["discharged_mwh_per_mw"],
+            "2H Equivalent Full Cycles": d2["efc"],
+            "4H Equivalent Full Cycles": d4["efc"],
+        })
+        for duration, result in [(2, d2), (4, d4)]:
+            out = result["dispatch"].copy()
+            out["Date"] = date_label
+            out["Duration"] = f"{duration}H"
+            dispatch_frames.append(out)
+
+    daily = pd.DataFrame(daily_rows)
+    dispatch_all = pd.concat(dispatch_frames, ignore_index=True) if dispatch_frames else pd.DataFrame()
+    if not daily.empty:
+        daily = daily.sort_values("Date").reset_index(drop=True)
+    return daily, dispatch_all, skipped_days
+
+
+# ─────────────────────────────────────────────
 #  SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚡ ERCOT BESS")
+    st.markdown("## SUNSTRIPE <span style='color:#e03a46'>/</span> ENERGY INTELLIGENCE", unsafe_allow_html=True)
+    st.caption("ERCOT LMP • Battery storage analytics")
+    st.caption("CSV support: hourly prices or SCED timestamps (hourly averages for duration screening)")
     st.markdown("---")
     page = st.radio("Module", [
         "🏠  Home",
@@ -266,7 +514,7 @@ with st.sidebar:
         "🤖  AI Copilot"
     ], label_visibility="collapsed")
     st.markdown("---")
-    st.markdown("### 📂 LMP Data")
+    st.markdown("### LMP DATA")
     uploaded = st.file_uploader("Upload ERCOT LMP CSV", type=["csv"], label_visibility="collapsed")
     if uploaded:
         df = load_lmp(uploaded)
@@ -279,14 +527,14 @@ with st.sidebar:
 
     # Settlement points status
     st.markdown("---")
-    st.markdown("### 🔌 Settlement Points")
+    st.markdown("### SETTLEMENT POINTS")
     if sp_df is not None:
         st.success(f"✅ {sp_df['SUBSTATION'].nunique():,} substations · {len(sp_df):,} buses")
     else:
         st.error("❌ Settlement CSV not found")
 
     st.markdown("---")
-    st.markdown("### 🔗 Other Tools")
+    st.markdown("### OTHER TOOLS")
     st.markdown(f'<a href="{SECOND_APP_URL}" target="_blank"><button style="width:100%;padding:8px;background:#1e2a3a;color:#4fc3f7;border:1px solid #2a3d55;border-radius:8px;cursor:pointer;font-size:13px;">📍 Open Fatal Flaw Analyser — SiteIQ</button></a>', unsafe_allow_html=True)
 
 
@@ -297,8 +545,8 @@ if page == "🏠  Home":
     st.markdown("""
     <div style="text-align:center;padding:40px 0 20px 0;">
         <div style="font-size:52px;">⚡</div>
-        <h1 style="font-size:32px;font-weight:800;margin:8px 0 4px 0;">ERCOT BESS Intelligence Platform</h1>
-        <p style="color:#7880a8;font-size:15px;margin:0;">Battery Energy Storage & LMP Analysis Suite</p>
+        <h1 style="font-size:32px;font-weight:800;margin:8px 0 4px 0;">Sunstripe ERCOT LMP & BESS Intelligence</h1>
+        <p style="color:#7880a8;font-size:15px;margin:0;">Nodal price signals • Dispatch optimisation • Duration screening</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -314,7 +562,7 @@ if page == "🏠  Home":
                     border-radius:16px;padding:28px 24px;height:100%;">
             <div style="font-size:36px;margin-bottom:12px;">⚡</div>
             <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:8px;">
-                ERCOT BESS Dashboard
+                Sunstripe ERCOT BESS Intelligence
             </div>
             <div style="color:#7880a8;font-size:13px;line-height:1.7;margin-bottom:20px;">
                 <b style="color:#5de0a5;">Current App</b><br><br>
@@ -381,7 +629,7 @@ if page == "🏠  Home":
     st.markdown("")
     st.markdown("""
     <div style="text-align:center;color:#3a3e55;font-size:12px;padding:20px 0 0 0;">
-        Built for ERCOT BESS Development · Powered by Claude AI · Data from OpenStreetMap & ERCOT
+        SUNSTRIPE ENERGY INTELLIGENCE  •  ERCOT nodal pricing  •  Battery duration screening
     </div>
     """, unsafe_allow_html=True)
 
@@ -640,7 +888,7 @@ out center tags;
                             sel_date_node = st.selectbox("Select Date", dates, key="node_lmp_date") if len(dates) > 1 else dates[0]
 
                             if sel_lmp_buses:
-                                PALETTE = ["#00d4ff","#ff8c42","#5de0a5","#bf7fff","#FFD700","#ff6b6b","#74c0fc","#f06292"]
+                                PALETTE = ["#c92532", "#171717", "#777777", "#e58c22", "#9d6b73", "#5f6972", "#b8b8b2", "#d4a1a6"]
                                 fig_node_lmp = go.Figure()
                                 node_summary = []
 
@@ -668,12 +916,12 @@ out center tags;
                                             "Min LMP": round(bdf["LMP"].min(), 2),
                                             "Max LMP": round(bdf["LMP"].max(), 2),
                                             "Spread": sp,
-                                            "2H Rev ($/MWh)": r2,
-                                            "4H Rev ($/MWh)": r4,
+                                            "3H Window Proxy Spread ($/MWh)": r2,
+                                            "5H Window Proxy Spread ($/MWh)": r4,
                                         })
 
                                 fig_node_lmp.update_layout(
-                                    template="plotly_dark",
+                                    template="plotly_white",
                                     title=f"LMP at {selected_ercot_sub} Buses — {sel_date_node}",
                                     xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1),
                                     yaxis=dict(title="LMP ($/MWh)"),
@@ -683,7 +931,7 @@ out center tags;
                                 st.plotly_chart(fig_node_lmp, use_container_width=True)
 
                                 if node_summary:
-                                    st.markdown("**BESS Revenue Summary (Rolling-Avg Strategy)**")
+                                    st.markdown("**Quick rolling-average proxy (not optimised dispatch revenue)**")
                                     sum_df = pd.DataFrame(node_summary).sort_values("Spread", ascending=False)
                                     st.dataframe(sum_df, use_container_width=True)
 
@@ -691,7 +939,7 @@ out center tags;
                                     best = sum_df.iloc[0]["Bus"]
                                     if st.button(f"📈 Open full analysis for **{best}**", key="jump_lmp_from_node"):
                                         st.session_state.selected_bus = best
-                                        st.info(f"Switched to **{best}** — go to 📈 LMP Price Analysis.")
+                                        st.info(f"Switched to **{best}** — open the BESS Duration Assessment tab.")
                         else:
                             st.warning(
                                 f"No buses from **{selected_ercot_sub}** were found in your LMP data. "
@@ -788,7 +1036,7 @@ out center tags;
                             annotation_font=dict(color="#5de0a5", size=10)
                         )
                         fig_rt.update_layout(
-                            template="plotly_dark",
+                            template="plotly_white",
                             title=f"Real-Time LMP — {sp_clean}  (Last 2 Hours)",
                             xaxis_title="Time (UTC)",
                             yaxis_title="LMP ($/MWh)",
@@ -848,7 +1096,7 @@ Real-Time LMP Data (last fetched):
             screen_context = f"""
 You are an expert ERCOT energy market analyst and BESS developer advisor.
 
-The user has just run a substation search on the ERCOT BESS Dashboard.
+The user has just run a substation search on the Sunstripe ERCOT BESS Intelligence.
 Summarise what is currently on the screen in a clear, professional manner.
 
 === SEARCH PARAMETERS ===
@@ -938,225 +1186,263 @@ elif page == "📈  LMP Price Analysis":
         st.stop()
 
     tab1, tab2, tab3, tab4 = st.tabs([
-        "🔍 Single Bus Analysis",
+        "🔋 BESS Duration Assessment",
         "🔌 Substation Lookup",
         "📊 Top N Buses by Spread",
         "📥 Export Revenue Table"
     ])
 
-    # ═══ TAB 1 – Single Bus ═══════════════════
+    # ═══ TAB 1 – DURATION ASSESSMENT ══════════
     with tab1:
-        bus_list = sorted(df["Bus"].unique().tolist())
-        default_idx = 0
-        if st.session_state.selected_bus and st.session_state.selected_bus in bus_list:
-            default_idx = bus_list.index(st.session_state.selected_bus)
+        st.markdown("### BESS duration decision")
+        st.caption("Compare 2-hour and 4-hour storage using the selected node's historical hourly LMPs and an explicit dispatch model.")
 
-        bus = st.selectbox("Search & select Bus name", bus_list, index=default_idx)
+        bus_list = sorted(df["Bus"].dropna().astype(str).unique().tolist())
+        default_idx = bus_list.index(st.session_state.selected_bus) if st.session_state.selected_bus in bus_list else 0
+        bus = st.selectbox("Settlement point / bus", bus_list, index=default_idx, key="duration_bus")
         st.session_state.selected_bus = bus
 
-        # ── Show substation info for selected bus ──
         if sp_df is not None:
-            bus_info = sp_df[sp_df["ELECTRICAL_BUS"] == bus]
+            bus_info = sp_df[sp_df["ELECTRICAL_BUS"].astype(str) == str(bus)]
             if not bus_info.empty:
                 row0 = bus_info.iloc[0]
                 st.markdown(
-                    f"**Substation:** `{row0['SUBSTATION']}` · "
-                    f"**Load Zone:** `{row0['SETTLEMENT_LOAD_ZONE']}` · "
-                    f"**Voltage:** `{row0['VOLTAGE_LEVEL']} kV` · "
+                    f"**Substation:** `{row0['SUBSTATION']}` &nbsp; | &nbsp; "
+                    f"**Load zone:** `{row0['SETTLEMENT_LOAD_ZONE']}` &nbsp; | &nbsp; "
+                    f"**Voltage:** `{row0['VOLTAGE_LEVEL']} kV` &nbsp; | &nbsp; "
                     f"**Hub:** `{row0['HUB'] if row0['HUB'] not in ['nan',''] else '—'}`"
                 )
-                # Show sibling buses at same substation
-                siblings = sp_df[sp_df["SUBSTATION"] == row0["SUBSTATION"]]["ELECTRICAL_BUS"].unique()
-                siblings_in_lmp = sorted(set(siblings) & set(bus_list))
-                if len(siblings_in_lmp) > 1:
-                    with st.expander(f"🔗 {len(siblings_in_lmp)} sibling buses at {row0['SUBSTATION']} (in LMP data)"):
-                        sib_cols = st.columns(min(6, len(siblings_in_lmp)))
-                        for si, sib_bus in enumerate(siblings_in_lmp[:12]):
-                            with sib_cols[si % len(sib_cols)]:
-                                if st.button(sib_bus, key=f"sib_{sib_bus}"):
-                                    st.session_state.selected_bus = sib_bus
-                                    st.rerun()
 
-        dates = sorted(df["Date"].unique().tolist())
-        multi_date = st.checkbox("📅 Compare multiple dates on one chart", value=False)
-        if multi_date:
-            sel_dates = st.multiselect("Select Dates", dates, default=dates[:min(3,len(dates))])
-            if not sel_dates:
-                st.warning("Select at least one date.")
-                st.stop()
+        bus_data = df[df["Bus"].astype(str) == str(bus)].copy()
+        bus_data["_analysis_date"] = pd.to_datetime(bus_data["Date"], errors="coerce").dt.date
+        bus_data = bus_data.dropna(subset=["_analysis_date", "Hour", "LMP"])
+        valid_dates = sorted(bus_data["_analysis_date"].dropna().unique().tolist())
+        if not valid_dates:
+            st.warning("No usable date/hour/LMP records were found for this bus. Check the uploaded CSV's Date, Hour and LMP fields.")
+            st.stop()
+
+        left, right = st.columns([2, 1])
+        with left:
+            period = st.date_input(
+                "Historical analysis period",
+                value=(valid_dates[0], valid_dates[-1]),
+                min_value=valid_dates[0], max_value=valid_dates[-1],
+                key="duration_period"
+            )
+        with right:
+            plant_mw = st.number_input("Reference plant power (MW)", min_value=0.1, max_value=5000.0,
+                                       value=100.0, step=10.0, key="duration_plant_mw",
+                                       help="The optimisation is run per 1 MW, then scaled linearly under a price-taker assumption.")
+        if isinstance(period, (tuple, list)) and len(period) == 2:
+            start_date, end_date = period
         else:
-            sel_date  = st.selectbox("Select Date", dates) if len(dates)>1 else dates[0]
-            sel_dates = [sel_date]
+            start_date = end_date = period
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+        chosen = bus_data[(bus_data["_analysis_date"] >= start_date) & (bus_data["_analysis_date"] <= end_date)].copy()
+        if chosen.empty:
+            st.warning("No records exist for the selected date range.")
+            st.stop()
 
-        show_2hr = st.checkbox("⚡ 2-Hour Storage  (3-hr rolling avg, ±1 hr windows)", value=True)
-        show_4hr = st.checkbox("⚡ 4-Hour Storage  (3-hr rolling avg, ±2 hr windows)", value=True)
+        st.markdown('<div class="section-header">Model assumptions</div>', unsafe_allow_html=True)
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            rte_pct = st.slider("Round-trip efficiency (%)", min_value=60, max_value=98, value=88, step=1,
+                                help="Split symmetrically between charging and discharging: each one-way efficiency is sqrt(RTE).")
+        with a2:
+            efc_limit = st.slider("Maximum equivalent full cycles/day", min_value=0.25, max_value=3.0,
+                                  value=1.0, step=0.25,
+                                  help="Editable dispatch-throughput limit, not an ERCOT rule or warranty limit.")
+        with a3:
+            degradation_cost = st.number_input("Degradation / variable cost ($/MWh discharged)", min_value=0.0,
+                                               max_value=500.0, value=0.0, step=1.0,
+                                               help="Optional variable cost applied to discharged MWh. Leave at zero if not yet estimated.")
+        with a4:
+            energy_capex = st.number_input("Installed energy cost ($/kWh)", min_value=0.0, max_value=3000.0,
+                                           value=0.0, step=25.0,
+                                           help="Enter a project-specific cost to test whether the extra 2 MWh/MW of a 4-hour battery pays for itself. Zero disables the capital-cost test.")
+        capital_rate = st.number_input("Annualized capital recovery / carrying rate (%)", min_value=0.0,
+                                       max_value=100.0, value=10.0, step=0.5,
+                                       help="Finance assumption only. Replace with your own capital recovery, financing and life assumptions.")
 
-        PALETTE = ["#00d4ff","#ff8c42","#5de0a5","#bf7fff","#FFD700","#ff6b6b","#74c0fc"]
+        st.caption("The 2H case is 1 MW / 2 MWh; the 4H case is 1 MW / 4 MWh. Both use the same MW rating and price series. The added 4H energy capacity is 2 MWh for each MW of power.")
 
-        fig = go.Figure()
-        summary_rows = []
+        with st.spinner("Optimising daily charge/discharge schedules for 2H and 4H systems …"):
+            try:
+                daily, dispatch_all, skipped_days = calculate_duration_assessment(
+                    chosen[["Date", "Hour", "LMP", "_analysis_date"]],
+                    rte_pct / 100.0, float(efc_limit), float(degradation_cost)
+                )
+            except RuntimeError as exc:
+                st.error(str(exc))
+                st.stop()
+            except Exception as exc:
+                st.error(f"Duration optimisation failed: {exc}")
+                st.stop()
 
-        for di, date in enumerate(sel_dates):
-            bdf = (df[(df["Bus"]==bus) & (df["Date"]==date)]
-                   .sort_values("Hour").reset_index(drop=True))
-            if bdf.empty:
-                continue
+        if daily.empty:
+            st.warning("No days had enough hourly price records to optimise. Please upload a dataset with at least 12 distinct hourly LMP points per day.")
+            st.stop()
+        if skipped_days:
+            st.warning(f"Skipped {skipped_days} date(s) with insufficient hourly coverage. Duplicate records within the same hour were averaged before optimisation.")
 
-            col = PALETTE[di % len(PALETTE)]
-            rev2, roll2, low2, high2, cw2, dw2 = bess_calc(bdf, half_w=1)
-            rev4, roll4, low4, high4, cw4, dw4 = bess_calc(bdf, half_w=2)
+        # Annualised historical run-rate is a sample statistic, not a forward forecast.
+        day_count = len(daily)
+        avg_2_per_mw_day = float(daily["2H Net Margin ($/MW-day)"].mean())
+        avg_4_per_mw_day = float(daily["4H Net Margin ($/MW-day)"].mean())
+        period_2 = float(daily["2H Net Margin ($/MW-day)"].sum()) * plant_mw
+        period_4 = float(daily["4H Net Margin ($/MW-day)"].sum()) * plant_mw
+        annual_2 = avg_2_per_mw_day * 365.0 * plant_mw
+        annual_4 = avg_4_per_mw_day * 365.0 * plant_mw
+        annual_inc_per_mw = (avg_4_per_mw_day - avg_2_per_mw_day) * 365.0
+        annual_inc_plant = annual_inc_per_mw * plant_mw
+        annualised_rate = capital_rate / 100.0
+        incremental_energy_capex_plant = 2.0 * 1000.0 * energy_capex * plant_mw
+        annualized_incremental_capex = incremental_energy_capex_plant * annualised_rate
+        incremental_contribution_after_capex = annual_inc_plant - annualized_incremental_capex
+        breakeven_capex_per_kwh = (annual_inc_per_mw / (2000.0 * annualised_rate)
+                                    if annualised_rate > 0 else np.nan)
+        cap_productivity_2 = (avg_2_per_mw_day * 365.0 / 2.0)
+        cap_productivity_4 = (avg_4_per_mw_day * 365.0 / 4.0)
 
-            min_lmp = bdf["LMP"].min()
-            max_lmp = bdf["LMP"].max()
-            spread  = max_lmp - min_lmp
+        st.markdown('<div class="section-header">Duration comparison</div>', unsafe_allow_html=True)
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            metric_card("2H net arbitrage margin", f"${annual_2:,.0f}/yr", f"{plant_mw:g} MW plant · annualised run-rate")
+        with k2:
+            metric_card("4H net arbitrage margin", f"${annual_4:,.0f}/yr", f"{plant_mw:g} MW plant · annualised run-rate")
+        with k3:
+            metric_card("4H incremental margin", f"${annual_inc_plant:,.0f}/yr", "vs 2H, before extra energy-capacity capex")
+        with k4:
+            metric_card("Value of extra duration", f"${annual_inc_per_mw/2:,.0f}", "per added MWh of capacity per year")
 
-            summary_rows.append({
-                "Date": date, "Bus": bus,
-                "Min LMP": round(min_lmp,2), "Min Hour": low2,
-                "Max LMP": round(max_lmp,2), "Max Hour": high2,
-                "Spread": round(spread,2),
-                "2H Revenue ($/MWh)": rev2,
-                "4H Revenue ($/MWh)": rev4,
-            })
+        comparison = pd.DataFrame([
+            {"Metric": "Historical period net margin", "2-hour": period_2, "4-hour": period_4, "Units": "$ total for selected period and reference plant"},
+            {"Metric": "Annualised net margin", "2-hour": annual_2, "4-hour": annual_4, "Units": "$ / year for reference plant"},
+            {"Metric": "Annualised margin per installed MWh", "2-hour": cap_productivity_2, "4-hour": cap_productivity_4, "Units": "$ / MWh nameplate / year / MW"},
+            {"Metric": "Average discharge price", "2-hour": daily["2H Discharge Price ($/MWh)"].mean(), "4-hour": daily["4H Discharge Price ($/MWh)"].mean(), "Units": "$ / MWh"},
+            {"Metric": "Average charge price", "2-hour": daily["2H Charge Price ($/MWh)"].mean(), "4-hour": daily["4H Charge Price ($/MWh)"].mean(), "Units": "$ / MWh"},
+            {"Metric": "Equivalent full cycles/day", "2-hour": daily["2H Equivalent Full Cycles"].mean(), "4-hour": daily["4H Equivalent Full Cycles"].mean(), "Units": "cycles / day"},
+        ])
+        st.dataframe(comparison, hide_index=True, use_container_width=True,
+                     column_config={"2-hour": st.column_config.NumberColumn(format="$%.2f"),
+                                    "4-hour": st.column_config.NumberColumn(format="$%.2f")})
 
-            fig.add_trace(go.Scatter(
-                x=bdf["Hour"], y=bdf["LMP"],
-                name=f"LMP {date}",
-                line=dict(color=col, width=2.5),
-                hovertemplate=f"Date: {date}<br>Hour %{{x}}<br>LMP: $%{{y:.2f}}<extra></extra>"
-            ))
+        st.markdown('<div class="section-header">Historical LMP with optimised dispatch</div>', unsafe_allow_html=True)
+        date_options = daily["Date"].astype(str).tolist()
+        rep_date = st.selectbox("Choose a date to inspect the dispatch schedule", date_options,
+                                index=len(date_options)-1, key="duration_plot_date")
+        view = dispatch_all[dispatch_all["Date"].astype(str) == str(rep_date)].copy()
+        if not view.empty:
+            lmp_plot = view[view["Duration"] == "2H"].sort_values("Hour")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=lmp_plot["Hour"], y=lmp_plot["LMP"], mode="lines+markers",
+                                     name="Observed hourly LMP", line=dict(color="#171717", width=2.5),
+                                     marker=dict(size=5, color="#171717"),
+                                     hovertemplate="Hour %{x}<br>LMP: $%{y:.2f}/MWh<extra></extra>"))
+            for duration, color_charge, color_discharge, label in [
+                ("2H", "#c92532", "#e58c22", "2-hour"),
+                ("4H", "#8b5c68", "#5c6570", "4-hour"),
+            ]:
+                dd = view[view["Duration"] == duration].sort_values("Hour")
+                charge_rows = dd[dd["Charge_MW"] > 0.02]
+                discharge_rows = dd[dd["Discharge_MW"] > 0.02]
+                if not charge_rows.empty:
+                    fig.add_trace(go.Scatter(x=charge_rows["Hour"], y=charge_rows["LMP"], mode="markers",
+                                             name=f"{label} charging", marker=dict(symbol="triangle-down", size=12, color=color_charge),
+                                             customdata=charge_rows[["Charge_MW", "SOC_MWh"]],
+                                             hovertemplate=f"{label} charge<br>Hour %{{x}}<br>LMP: $%{{y:.2f}}/MWh<br>Charge: %{{customdata[0]:.2f}} MW<extra></extra>"))
+                if not discharge_rows.empty:
+                    fig.add_trace(go.Scatter(x=discharge_rows["Hour"], y=discharge_rows["LMP"], mode="markers",
+                                             name=f"{label} discharging", marker=dict(symbol="triangle-up", size=12, color=color_discharge),
+                                             customdata=discharge_rows[["Discharge_MW", "SOC_MWh"]],
+                                             hovertemplate=f"{label} discharge<br>Hour %{{x}}<br>LMP: $%{{y:.2f}}/MWh<br>Discharge: %{{customdata[0]:.2f}} MW<extra></extra>"))
+            fig.update_layout(template="plotly_white", title=f"{bus} — observed LMP and price-taker dispatch — {rep_date}",
+                              xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1),
+                              yaxis=dict(title="LMP ($/MWh)"), hovermode="x unified", height=480,
+                              legend=dict(orientation="h", y=1.12, x=0))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Triangles mark modelled charge/discharge intervals. The schedule is an ex-post perfect-foresight backtest, not a real-time forecast or submitted ERCOT bid.")
 
-            if not multi_date:
-                if show_2hr:
-                    fig.add_trace(go.Scatter(
-                        x=bdf["Hour"], y=roll2,
-                        name="3-hr Roll Avg (2H basis)",
-                        line=dict(color="#00e676", width=1.5, dash="dot"),
-                        hovertemplate="Hour %{x}<br>3-hr Avg: $%{y:.2f}<extra></extra>"
-                    ))
-                if show_4hr and not show_2hr:
-                    fig.add_trace(go.Scatter(
-                        x=bdf["Hour"], y=roll4,
-                        name="3-hr Roll Avg (4H basis)",
-                        line=dict(color="#ff8c42", width=1.5, dash="dot"),
-                        hovertemplate="Hour %{x}<br>3-hr Avg: $%{y:.2f}<extra></extra>"
-                    ))
+        st.markdown('<div class="section-header">How the LMP trend changes the duration signal</div>', unsafe_allow_html=True)
+        monthly = daily.copy()
+        monthly["Month"] = pd.to_datetime(monthly["Date"]).dt.to_period("M").astype(str)
+        monthly = monthly.groupby("Month", as_index=False)[["2H Net Margin ($/MW-day)", "4H Net Margin ($/MW-day)" ]].mean()
+        if len(monthly):
+            fig_month = go.Figure()
+            fig_month.add_trace(go.Scatter(x=monthly["Month"], y=monthly["2H Net Margin ($/MW-day)"],
+                                           name="2H", mode="lines+markers", line=dict(color="#c92532", width=2.5)))
+            fig_month.add_trace(go.Scatter(x=monthly["Month"], y=monthly["4H Net Margin ($/MW-day)"],
+                                           name="4H", mode="lines+markers", line=dict(color="#171717", width=2.5)))
+            fig_month.update_layout(template="plotly_white", title="Average daily net arbitrage margin by month (per MW)",
+                                    xaxis_title="Month", yaxis_title="Net margin ($/MW-day)", height=350,
+                                    legend=dict(orientation="h", y=1.12, x=0))
+            st.plotly_chart(fig_month, use_container_width=True)
 
-                if show_2hr:
-                    fig.add_vrect(x0=cw2[0], x1=cw2[1],
-                                  fillcolor="#00e676", opacity=0.10, line_width=0,
-                                  annotation_text=f"Charge 2H\n(Avg low hr {low2})",
-                                  annotation_font=dict(size=9, color="#00e676"))
-                    fig.add_vrect(x0=dw2[0], x1=dw2[1],
-                                  fillcolor="#ff9800", opacity=0.10, line_width=0,
-                                  annotation_text=f"Discharge 2H\n(Avg high hr {high2})",
-                                  annotation_font=dict(size=9, color="#ff9800"))
-                    bdf["_2s"] = bdf["Hour"].apply(
-                        lambda h: -1 if cw2[0]<=h<=cw2[1] else (1 if dw2[0]<=h<=dw2[1] else 0))
-                    bdf["_2c"] = bdf["LMP"] + bdf["_2s"] * spread * 0.12
-                    fig.add_trace(go.Scatter(
-                        x=bdf["Hour"], y=bdf["_2c"],
-                        name="2H Storage Band",
-                        line=dict(color="#00e676", width=2, dash="dashdot", shape="hv"),
-                        hovertemplate="Hour %{x}<br>2H Band: $%{y:.2f}<extra></extra>"
-                    ))
+        st.markdown('<div class="section-header">Duration recommendation</div>', unsafe_allow_html=True)
+        if energy_capex > 0 and annualised_rate > 0:
+            if incremental_contribution_after_capex > 0:
+                st.success(
+                    f"**4-hour passes the incremental energy-capacity screen** under the entered assumptions. "
+                    f"The estimated incremental annual energy-arbitrage margin is ${annual_inc_plant:,.0f}; "
+                    f"the annualised carrying cost of the extra {2*plant_mw:,.0f} MWh is ${annualized_incremental_capex:,.0f}; "
+                    f"net incremental contribution is ${incremental_contribution_after_capex:,.0f}/year."
+                )
+            else:
+                st.warning(
+                    f"**2-hour is favoured on energy arbitrage plus the entered incremental energy-capacity cost.** "
+                    f"4-hour adds ${annual_inc_plant:,.0f}/year in estimated net arbitrage margin, versus "
+                    f"${annualized_incremental_capex:,.0f}/year of annualised extra energy-capacity cost. "
+                    f"Other revenues (ancillary services, capacity/RA, tolling) could change the decision."
+                )
+        else:
+            raw_winner = "4-hour" if annual_4 >= annual_2 else "2-hour"
+            productivity_winner = "2-hour" if cap_productivity_2 >= cap_productivity_4 else "4-hour"
+            if np.isfinite(breakeven_capex_per_kwh):
+                breakeven_line = f"The estimated break-even installed energy CAPEX for the additional 2 MWh/MW is about ${max(0.0, breakeven_capex_per_kwh):,.0f}/kWh at a {capital_rate:.1f}% annualised carrying rate."
+            else:
+                breakeven_line = "Set a positive annualised capital recovery rate to calculate a break-even energy CAPEX."
+            st.info(
+                f"**LMP-only signal:** {raw_winner} captures the higher total historical net arbitrage margin per MW, "
+                f"while {productivity_winner} has the higher margin per MWh of installed energy capacity. "
+                f"{breakeven_line} Enter a project-specific installed energy cost above to get a capital-adjusted screen; "
+                f"without it, historical LMPs alone cannot establish investment feasibility."
+            )
 
-                if show_4hr:
-                    fig.add_vrect(x0=cw4[0], x1=cw4[1],
-                                  fillcolor="#00bcd4", opacity=0.07, line_width=0,
-                                  annotation_text=f"Charge 4H\n(Avg low hr {low4})",
-                                  annotation_font=dict(size=9, color="#00bcd4"))
-                    fig.add_vrect(x0=dw4[0], x1=dw4[1],
-                                  fillcolor="#ff5722", opacity=0.07, line_width=0,
-                                  annotation_text=f"Discharge 4H\n(Avg high hr {high4})",
-                                  annotation_font=dict(size=9, color="#ff5722"))
-                    bdf["_4s"] = bdf["Hour"].apply(
-                        lambda h: -1 if cw4[0]<=h<=cw4[1] else (1 if dw4[0]<=h<=dw4[1] else 0))
-                    bdf["_4c"] = bdf["LMP"] + bdf["_4s"] * spread * 0.20
-                    fig.add_trace(go.Scatter(
-                        x=bdf["Hour"], y=bdf["_4c"],
-                        name="4H Storage Band",
-                        line=dict(color="#ff8c42", width=2, dash="dash", shape="hv"),
-                        hovertemplate="Hour %{x}<br>4H Band: $%{y:.2f}<extra></extra>"
-                    ))
+        st.markdown('<div class="section-header">Daily backtest results</div>', unsafe_allow_html=True)
+        st.dataframe(daily, hide_index=True, use_container_width=True, height=300)
+        csv_data = daily.to_csv(index=False).encode("utf-8")
+        st.download_button("Download daily 2H vs 4H backtest CSV", data=csv_data,
+                           file_name=f"Sunstripe_BESS_Duration_{bus}_{start_date}_{end_date}.csv",
+                           mime="text/csv")
 
-                if show_2hr:
-                    fig.add_trace(go.Scatter(
-                        x=[low2], y=[bdf.loc[bdf["Hour"]==low2, "LMP"].values[0]],
-                        mode="markers+text",
-                        marker=dict(size=13, color="#00e676", symbol="triangle-up"),
-                        text=[f"  Charge\n${roll2.min():.1f} avg"],
-                        textposition="middle right",
-                        textfont=dict(color="#00e676", size=9),
-                        name=f"Avg Low hr {low2}",
-                        hovertemplate=f"Hour {low2} — Roll Avg Min: ${roll2.min():.2f}<extra></extra>"
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=[high2], y=[bdf.loc[bdf["Hour"]==high2, "LMP"].values[0]],
-                        mode="markers+text",
-                        marker=dict(size=13, color="#ff9800", symbol="triangle-down"),
-                        text=[f"  Discharge\n${roll2.max():.1f} avg"],
-                        textposition="middle right",
-                        textfont=dict(color="#ff9800", size=9),
-                        name=f"Avg High hr {high2}",
-                        hovertemplate=f"Hour {high2} — Roll Avg Max: ${roll2.max():.2f}<extra></extra>"
-                    ))
-
-        fig.update_layout(
-            template="plotly_dark",
-            title=dict(text=f"LMP & Rolling-Average BESS Strategy — <b>{bus}</b>", font=dict(size=15)),
-            xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1,
-                       showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
-            yaxis=dict(title="LMP ($/MWh)",
-                       showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
-            legend=dict(orientation="h", y=1.10, x=0,
-                        bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
-            hovermode="x unified", height=530
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("ℹ️  How the rolling-average BESS strategy works"):
+        with st.expander("Research basis, optimisation method and limitations"):
             st.markdown("""
-**Step 1 — Smooth the price curve**
-A **3-hour centred rolling average** is calculated across all 24 hours:
-`Roll[h] = mean(LMP[h-1], LMP[h], LMP[h+1])`
-This removes single-hour price spikes that would be impractical to capture.
+**Research used to frame the duration decision**
 
-**Step 2 — Find the smoothed low & high**
-- The hour with the **lowest** rolling average → optimal charge centre
-- The hour with the **highest** rolling average → optimal discharge centre
+- **ERCOT, *Security Constrained Unit Commitment (SCUC)-Based Tool to Manage the Grid with Large Penetration of Energy Storage Resources* (August 2025).** ERCOT explains that the duration signal from energy-price arbitrage should be read from the duration of high-price discharge opportunities versus low-price charging opportunities. Its discussion says energy arbitrage by itself did not provide a sufficient signal for investment in duration beyond roughly 2–4 hours; ancillary-service requirements and other revenue constructs also matter. [ERCOT report (PDF)](https://www.ercot.com/files/docs/2025/08/29/Security-Constrained-Unit-Commitment.pdf)
 
-**Step 3 — Set the windows**
-| Storage | Charge window | Discharge window |
-|---------|--------------|-----------------|
-| 2H BESS | ±1 hr around avg-low | ±1 hr around avg-high |
-| 4H BESS | ±2 hr around avg-low | ±2 hr around avg-high |
+- **Turan & Cole, *Revenue Analysis for Energy Storage Systems in the United States* (NREL/NLR, 2024).** The study evaluates historical and projected prices, durations from 1 to 12 hours, location, and round-trip efficiency. Its published summary finds that revenue generally rises with duration, but marginal value declines as duration increases, and economics depend on location and efficiency. [Report page](https://research-hub.nlr.gov/en/publications/revenue-analysis-for-energy-storage-systems-in-the-united-states/) · [Full report](https://www.nrel.gov/docs/fy25osti/89906.pdf)
 
-**Revenue** = average LMP during discharge window − average LMP during charge window
+- **Modo Energy, *ERCOT: Annual battery energy storage revenue report 2024* (published March 2025).** This market review illustrates why nodal energy arbitrage should not be treated as total BESS revenue: realised battery earnings include multiple market products, and reported returns can change as deployed storage and market conditions change. [Research article](https://modoenergy.com/research/ercot-battery-energy-storage-revenues-energy-markets-ancillary-services-capacity-location-owners-operators-annual-report-2024)
+
+**What this app calculates**
+
+The optimiser treats historical LMPs as fixed (a price-taker / ex-post backtest), runs a separate daily schedule for each duration, and maximises energy-market margin subject to a 1 MW AC power limit, a 2 MWh or 4 MWh energy limit, round-trip efficiency split symmetrically between charge and discharge, a user-set discharge-throughput / equivalent-full-cycle limit, no simultaneous charging and discharging, and equal start/end state of charge each day. Missing hourly prices cannot be dispatched; duplicate records in an hour are averaged.
+
+**Objective, per 1 MW of power**
+
+`Net margin = Σ(discharge MW × LMP × Δt) − Σ(charge MW × LMP × Δt) − degradation cost`
+
+The annualised figure is the average daily margin in the selected history multiplied by 365. It is a simple historical run-rate, not a price forecast or a bankable revenue forecast. The capital test only compares the incremental 2 MWh/MW energy capacity using the user's stated installed $/kWh and annualised carrying rate.
+
+**Not included:** ancillary-service revenues, capacity/resource-adequacy payments, tolling contracts, negative-price or bid strategy beyond observed LMPs, market-price impact from the project, congestion deliverability studies, network losses/auxiliary load, charging limits imposed by interconnection, taxes, fixed O&M, augmentation/replacement, warranties, degradation not entered above, financing structure, construction costs, and merchant-price forecasts. Use this as an initial screening tool, not final project investment advice.
             """)
-
-        if summary_rows:
-            sr = summary_rows[0]
-            k1,k2,k3,k4,k5 = st.columns(5)
-            with k1: metric_card("Bus", bus)
-            with k2: metric_card("Lowest LMP",   f"${sr['Min LMP']:.2f}",  f"Hour {sr['Min Hour']}")
-            with k3: metric_card("Highest LMP",  f"${sr['Max LMP']:.2f}",  f"Hour {sr['Max Hour']}")
-            with k4: metric_card("2H Arbitrage", f"${sr['2H Revenue ($/MWh)']:.2f}", "$/MWh net")
-            with k5: metric_card("4H Arbitrage", f"${sr['4H Revenue ($/MWh)']:.2f}", "$/MWh net")
-            st.markdown("")
-            sp = sr["Spread"]
-            if sp > 80:   st.success("✅  Pure Merchant Arbitrage Opportunity")
-            elif sp > 40: st.warning("⚠️  Solar + Storage Overbuild Recommended")
-            else:         st.error("❌  Low Spread → Capacity / Ancillary Market Focus")
-
-        if multi_date and summary_rows:
-            st.markdown("---")
-            st.markdown('<div class="section-header">Multi-Date Summary</div>', unsafe_allow_html=True)
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
     # ═══ TAB 2 – Substation Lookup ════════════
     with tab2:
         st.markdown('<div class="section-header">🔌 Find Buses by ERCOT Substation</div>', unsafe_allow_html=True)
+        st.caption("Any 2H/4H values shown in this lookup are quick rolling-average spread proxies, not optimised revenue.")
         st.caption("Search for an ERCOT substation name to see all its buses and their LMP data.")
 
         if sp_df is None:
@@ -1220,7 +1506,7 @@ This removes single-hour price spikes that would be impractical to capture.
                     sel_date_t2 = st.selectbox("Date", dates, key="tab2_date") if len(dates) > 1 else dates[0]
 
                     if sel_plot_buses:
-                        PALETTE = ["#00d4ff","#ff8c42","#5de0a5","#bf7fff","#FFD700","#ff6b6b","#74c0fc","#f06292"]
+                        PALETTE = ["#c92532", "#171717", "#777777", "#e58c22", "#9d6b73", "#5f6972", "#b8b8b2", "#d4a1a6"]
                         fig_t2 = go.Figure()
                         rev_rows_t2 = []
 
@@ -1242,12 +1528,12 @@ This removes single-hour price spikes that would be impractical to capture.
                                 sp_val = round(bdf["LMP"].max() - bdf["LMP"].min(), 2)
                                 rev_rows_t2.append({
                                     "Bus": bname, "Spread": sp_val,
-                                    "2H Rev": r2, "4H Rev": r4,
+                                    "3H Window Proxy Spread ($/MWh)": r2, "5H Window Proxy Spread ($/MWh)": r4,
                                     "Avg LMP": round(bdf["LMP"].mean(), 2),
                                 })
 
                         fig_t2.update_layout(
-                            template="plotly_dark",
+                            template="plotly_white",
                             title=f"LMP at {chosen_sub} — {sel_date_t2}",
                             xaxis=dict(title="Hour Ending", tickmode="linear", dtick=1),
                             yaxis=dict(title="LMP ($/MWh)"),
@@ -1257,14 +1543,14 @@ This removes single-hour price spikes that would be impractical to capture.
                         st.plotly_chart(fig_t2, use_container_width=True)
 
                         if rev_rows_t2:
-                            st.markdown("**BESS Revenue (Rolling-Avg Strategy)**")
+                            st.markdown("**Quick rolling-average proxy (not optimised dispatch revenue)**")
                             rev_df_t2 = pd.DataFrame(rev_rows_t2).sort_values("Spread", ascending=False)
                             st.dataframe(rev_df_t2, use_container_width=True)
 
                             best_b = rev_df_t2.iloc[0]["Bus"]
                             if st.button(f"📈 Full BESS analysis for **{best_b}**", key="jump_from_tab2"):
                                 st.session_state.selected_bus = best_b
-                                st.info(f"Switched to **{best_b}** — click the 'Single Bus Analysis' tab.")
+                                st.info(f"Switched to **{best_b}** — open the 'BESS Duration Assessment' tab.")
                 else:
                     st.warning(
                         f"None of the {len(sub_buses)} buses at **{chosen_sub}** appear in your uploaded LMP data. "
@@ -1276,6 +1562,7 @@ This removes single-hour price spikes that would be impractical to capture.
     # ═══ TAB 3 – Top N Buses ══════════════════
     with tab3:
         st.markdown('<div class="section-header">Top N Buses by LMP Spread</div>', unsafe_allow_html=True)
+        st.caption("Spread rankings are an initial locator only. Use the BESS Duration Assessment tab for optimised 2H/4H dispatch economics.")
         dates_all = sorted(df["Date"].unique().tolist())
         c1, c2 = st.columns(2)
         with c1: top_n = st.slider("Show Top N Buses", 5, 50, 15)
@@ -1296,7 +1583,7 @@ This removes single-hour price spikes that would be impractical to capture.
             bdf_t = filt[filt["Bus"]==row["Bus"]].sort_values("Hour").reset_index(drop=True)
             r2, _, lh2, hh2, _, _ = bess_calc(bdf_t, 1)
             r4, _, lh4, hh4, _, _ = bess_calc(bdf_t, 2)
-            rev_rows.append({"Bus":row["Bus"],"2H Rev":r2,"4H Rev":r4,
+            rev_rows.append({"Bus":row["Bus"],"3H Window Proxy Spread ($/MWh)":r2,"5H Window Proxy Spread ($/MWh)":r4,
                              "Low Hr":lh2,"High Hr":hh2})
         top_df = bus_stats.merge(pd.DataFrame(rev_rows), on="Bus")
 
@@ -1309,27 +1596,27 @@ This removes single-hour price spikes that would be impractical to capture.
 
         fig_top = px.bar(
             top_df, x="Bus", y="Spread", color="Spread",
-            color_continuous_scale=["#f07070","#f0c040","#5de0a5"],
-            labels={"Spread":"LMP Spread ($/MWh)"}, template="plotly_dark",
+            color_continuous_scale=["#f0d7d9","#c92532","#171717"],
+            labels={"Spread":"LMP Spread ($/MWh)"}, template="plotly_white",
             title=f"Top {top_n} Buses by LMP Spread — {top_date}"
         )
         fig_top.update_layout(xaxis_tickangle=-40, coloraxis_showscale=False, height=420)
         st.plotly_chart(fig_top, use_container_width=True)
 
         fig_sc = px.scatter(
-            top_df, x="Spread", y="4H Rev", text="Bus", size="Spread",
-            color="4H Rev", color_continuous_scale=["#4fc3f7","#bf7fff","#ff8c42"],
-            template="plotly_dark", title="Spread vs 4H BESS Revenue (Rolling-Avg Strategy)",
-            labels={"Spread":"LMP Spread ($/MWh)","4H Rev":"4H Revenue ($/MWh)"}
+            top_df, x="Spread", y="5H Window Proxy Spread ($/MWh)", text="Bus", size="Spread",
+            color="5H Window Proxy Spread ($/MWh)", color_continuous_scale=["#dededb","#c92532","#171717"],
+            template="plotly_white", title="Spread vs 5H Quick rolling-average proxy (not optimised dispatch revenue)",
+            labels={"Spread":"LMP Spread ($/MWh)","5H Window Proxy Spread ($/MWh)":"5H Window Proxy Spread ($/MWh)"}
         )
         fig_sc.update_traces(textposition="top center", textfont=dict(size=8))
         fig_sc.update_layout(height=400)
         st.plotly_chart(fig_sc, use_container_width=True)
 
         def _style_spread(val):
-            if val>80:  return "background-color:#1f4b2e;color:#5de0a5"
-            if val>40:  return "background-color:#3d3510;color:#f0c040"
-            return "background-color:#2e1a1a;color:#f07070"
+            if val>80:  return "background-color:#f8e4e5;color:#9e1722"
+            if val>40:  return "background-color:#f1f1ee;color:#555555"
+            return "background-color:#ffffff;color:#171717"
         st.dataframe(
             top_df.style.applymap(_style_spread, subset=["Spread"]),
             use_container_width=True, height=320
@@ -1338,16 +1625,16 @@ This removes single-hour price spikes that would be impractical to capture.
             best_bus = top_df.iloc[0]["Bus"]
             if st.button(f"📈  Analyse top bus: {best_bus}"):
                 st.session_state.selected_bus = best_bus
-                st.info(f"Switched to **{best_bus}** — click the 'Single Bus Analysis' tab.")
+                st.info(f"Switched to **{best_bus}** — open the 'BESS Duration Assessment' tab.")
 
     # ═══ TAB 4 – Export ═══════════════════════
     with tab4:
-        st.markdown('<div class="section-header">Export BESS Revenue for All Buses</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Export quick spread proxies for all buses</div>', unsafe_allow_html=True)
         dates_exp = sorted(df["Date"].unique().tolist())
         exp_date  = st.selectbox("Select Date for Export", dates_exp, key="exp_date") if len(dates_exp)>1 else dates_exp[0]
 
-        if st.button("⚙️  Compute Revenue for All Buses", type="primary"):
-            with st.spinner("Calculating rolling-average BESS revenue for all buses …"):
+        if st.button("⚙️  Compute quick proxy for All Buses", type="primary"):
+            with st.spinner("Calculating quick rolling-average proxies for all buses …"):
                 exp_rows = []
                 for bus_name in df["Bus"].unique():
                     bdf_e = (df[(df["Bus"]==bus_name) & (df["Date"]==exp_date)]
@@ -1357,8 +1644,7 @@ This removes single-hour price spikes that would be impractical to capture.
                     r2, _, lh, hh, cw2, dw2 = bess_calc(bdf_e, 1)
                     r4, _, _,  _,  cw4, dw4 = bess_calc(bdf_e, 2)
                     sp = round(bdf_e["LMP"].max() - bdf_e["LMP"].min(), 2)
-                    rec = ("Merchant Arbitrage" if sp>80
-                           else ("Solar + Storage Overbuild" if sp>40 else "Ancillary / Capacity"))
+                    rec = "Use the BESS Duration Assessment optimiser; spread alone is not a feasibility verdict"
 
                     row_data = {
                         "Date": exp_date, "Bus": bus_name,
@@ -1366,13 +1652,13 @@ This removes single-hour price spikes that would be impractical to capture.
                         "Max LMP": round(bdf_e["LMP"].max(),2),
                         "Avg LMP": round(bdf_e["LMP"].mean(),2),
                         "Spread ($/MWh)": sp,
-                        "2H Charge Window":    f"Hr {cw2[0]:.0f}–{cw2[1]:.0f}",
-                        "2H Discharge Window": f"Hr {dw2[0]:.0f}–{dw2[1]:.0f}",
-                        "4H Charge Window":    f"Hr {cw4[0]:.0f}–{cw4[1]:.0f}",
-                        "4H Discharge Window": f"Hr {dw4[0]:.0f}–{dw4[1]:.0f}",
-                        "2H Revenue ($/MWh)": r2,
-                        "4H Revenue ($/MWh)": r4,
-                        "Recommended Strategy": rec,
+                        "3H Proxy Charge Window":    f"Hr {cw2[0]:.0f}–{cw2[1]:.0f}",
+                        "3H Proxy Discharge Window": f"Hr {dw2[0]:.0f}–{dw2[1]:.0f}",
+                        "5H Proxy Charge Window":    f"Hr {cw4[0]:.0f}–{cw4[1]:.0f}",
+                        "5H Proxy Discharge Window": f"Hr {dw4[0]:.0f}–{dw4[1]:.0f}",
+                        "3H Window Proxy Spread ($/MWh)": r2,
+                        "5H Window Proxy Spread ($/MWh)": r4,
+                        "Screening Note": rec,
                     }
 
                     # Add substation info
@@ -1395,7 +1681,7 @@ This removes single-hour price spikes that would be impractical to capture.
             st.download_button(
                 label="📥  Download CSV",
                 data=exp_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"BESS_Revenue_{exp_date}.csv",
+                file_name=f"Sunstripe_Quick_Spread_Proxy_{exp_date}.csv",
                 mime="text/csv", type="primary"
             )
 
@@ -1464,16 +1750,10 @@ Top 10 buses by LMP Spread:
 {top_buses_ai.to_string(index=False)}
 {sub_context}
 
-BESS Strategy used in this dashboard:
-- A 3-hour centred rolling average smooths the price curve before finding optimal charge/discharge hours.
-- 2H BESS: charges ±1 hr around smoothed price minimum; discharges ±1 hr around smoothed maximum.
-- 4H BESS: charges ±2 hr around smoothed price minimum; discharges ±2 hr around smoothed maximum.
-- Revenue = avg discharge LMP − avg charge LMP.
-
-Strategy thresholds:
-- Spread > $80/MWh  → Pure Merchant Arbitrage
-- Spread $40–80/MWh → Solar + Storage Overbuild
-- Spread < $40/MWh  → Capacity / Ancillary Market Focus
+Duration methodology note:
+- The Single Bus / BESS Duration Assessment tab uses an hourly price-taker MILP optimisation for 2-hour and 4-hour systems, with SOC, efficiency, charge/discharge power, no simultaneous charging/discharging, daily cyclic SOC, and a configurable EFC/day cap.
+- The legacy quick spread ranking/export modules still display a rolling-average proxy; do not treat it as optimised revenue or bankable economics.
+- LMP-only margin excludes ancillary services, capacity/tolling revenues, price impact, fixed O&M, and capital cost unless explicitly entered in the duration screen.
 
 Answer concisely and specifically using numbers from the dataset. Focus on actionable BESS development insights.
 When the user asks about a bus, also mention which substation it belongs to and its load zone if available.
